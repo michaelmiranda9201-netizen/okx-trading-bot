@@ -1,22 +1,18 @@
 import os
+import time
+import json
+import hmac
+import base64
+import hashlib
 import requests
 import numpy as np
-import time
-import okx.Trade as Trade
-import okx.Account as Account
+from datetime import datetime
 
-# ==========================================
-# CONFIGURACION
-# ==========================================
+BASE_URL = "https://www.okx.com"
 
 API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
 SECRET_KEY = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
 PASSPHRASE = os.getenv("WXcv8089@")
-
-tradeAPI = Trade.TradeAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, "0")
-accountAPI = Account.AccountAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, "0")
-
-BASE_URL = "https://www.okx.com"
 
 MAX_OPERACIONES = 2
 SCORE_MINIMO = 85
@@ -24,34 +20,77 @@ RIESGO = 0.08
 
 operaciones_abiertas = {}
 
-# ==========================================
+# ======================================
 # LOG
-# ==========================================
+# ======================================
 
 def log(msg):
     print(f"[BOT] {msg}")
 
-# ==========================================
+
+# ======================================
+# FIRMA API OKX
+# ======================================
+
+def firma(timestamp, method, request_path, body=""):
+
+    mensaje = f"{timestamp}{method}{request_path}{body}"
+
+    mac = hmac.new(
+        SECRET_KEY.encode(),
+        mensaje.encode(),
+        hashlib.sha256
+    )
+
+    return base64.b64encode(mac.digest()).decode()
+
+
+# ======================================
+# HEADERS
+# ======================================
+
+def headers(method, path, body=""):
+
+    timestamp = datetime.utcnow().isoformat(timespec='milliseconds') + "Z"
+
+    sign = firma(timestamp, method, path, body)
+
+    return {
+        "OK-ACCESS-KEY": API_KEY,
+        "OK-ACCESS-SIGN": sign,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+        "Content-Type": "application/json"
+    }
+
+
+# ======================================
 # BALANCE
-# ==========================================
+# ======================================
 
 def obtener_balance():
 
+    path = "/api/v5/account/balance"
+
+    url = BASE_URL + path
+
+    r = requests.get(url, headers=headers("GET", path))
+
+    data = r.json()
+
     try:
-        data = accountAPI.get_account_balance()
-
-        for d in data['data'][0]['details']:
-            if d['ccy'] == 'USDT':
-                return float(d['availBal'])
-
+        for d in data["data"][0]["details"]:
+            if d["ccy"] == "USDT":
+                return float(d["availBal"])
     except:
-        pass
+        return 0
 
     return 0
 
-# ==========================================
-# PARES USDT
-# ==========================================
+
+# ======================================
+# OBTENER PARES
+# ======================================
 
 def obtener_pares():
 
@@ -67,9 +106,10 @@ def obtener_pares():
 
     return pares
 
-# ==========================================
+
+# ======================================
 # VELAS
-# ==========================================
+# ======================================
 
 def obtener_velas(par):
 
@@ -85,9 +125,10 @@ def obtener_velas(par):
 
     return closes, highs, lows
 
-# ==========================================
+
+# ======================================
 # EMA
-# ==========================================
+# ======================================
 
 def ema(data, period):
 
@@ -101,9 +142,10 @@ def ema(data, period):
 
     return a
 
-# ==========================================
+
+# ======================================
 # ATR
-# ==========================================
+# ======================================
 
 def calcular_atr(highs,lows,closes):
 
@@ -121,9 +163,10 @@ def calcular_atr(highs,lows,closes):
 
     return np.mean(trs[-14:])
 
-# ==========================================
+
+# ======================================
 # ESTRUCTURA
-# ==========================================
+# ======================================
 
 def estructura(highs,lows):
 
@@ -138,9 +181,10 @@ def estructura(highs,lows):
 
     return "RANGO"
 
-# ==========================================
+
+# ======================================
 # ANALISIS
-# ==========================================
+# ======================================
 
 def analizar(closes,highs,lows):
 
@@ -172,9 +216,10 @@ def analizar(closes,highs,lows):
 
     return score,tendencia,atr
 
-# ==========================================
-# PRECIO
-# ==========================================
+
+# ======================================
+# PRECIO ACTUAL
+# ======================================
 
 def precio_actual(par):
 
@@ -184,9 +229,10 @@ def precio_actual(par):
 
     return float(r["data"][0]["last"])
 
-# ==========================================
+
+# ======================================
 # ABRIR TRADE
-# ==========================================
+# ======================================
 
 def abrir_trade(par,tendencia,atr):
 
@@ -194,74 +240,36 @@ def abrir_trade(par,tendencia,atr):
 
     tamaño = round(balance * RIESGO,2)
 
-    lado = "buy" if tendencia == "LONG" else "sell"
+    side = "buy" if tendencia == "LONG" else "sell"
 
-    log(f"🚀 Ejecutando trade {par} {tendencia}")
-    log(f"Tamaño USDT {tamaño}")
+    path = "/api/v5/trade/order"
 
-    try:
+    body = json.dumps({
+        "instId": par,
+        "tdMode": "isolated",
+        "side": side,
+        "ordType": "market",
+        "sz": str(tamaño)
+    })
 
-        orden = tradeAPI.place_order(
-            instId=par,
-            tdMode="isolated",
-            side=lado,
-            ordType="market",
-            sz=str(tamaño)
-        )
+    url = BASE_URL + path
 
-        log(f"Orden enviada {orden}")
+    r = requests.post(url, headers=headers("POST", path, body), data=body)
 
-        operaciones_abiertas[par] = {
+    log(f"🚀 Orden enviada {par} {side}")
 
-            "lado":tendencia,
-            "atr":atr,
-            "sl":0
-        }
+    log(r.json())
 
-    except Exception as e:
+    operaciones_abiertas[par] = {
+        "lado": tendencia,
+        "atr": atr,
+        "sl": 0
+    }
 
-        log(f"Error trade {e}")
 
-# ==========================================
-# TRAILING
-# ==========================================
-
-def trailing():
-
-    for par in operaciones_abiertas:
-
-        try:
-
-            precio = precio_actual(par)
-
-            trade = operaciones_abiertas[par]
-
-            if trade["lado"] == "LONG":
-
-                nuevo_sl = precio - trade["atr"]
-
-                if nuevo_sl > trade["sl"]:
-
-                    trade["sl"] = nuevo_sl
-
-                    log(f"Trailing actualizado {par}")
-
-            if trade["lado"] == "SHORT":
-
-                nuevo_sl = precio + trade["atr"]
-
-                if nuevo_sl < trade["sl"]:
-
-                    trade["sl"] = nuevo_sl
-
-                    log(f"Trailing actualizado {par}")
-
-        except:
-            pass
-
-# ==========================================
+# ======================================
 # ESCANEO
-# ==========================================
+# ======================================
 
 def escanear():
 
@@ -280,7 +288,6 @@ def escanear():
             score,tendencia,atr = analizar(closes,highs,lows)
 
             mercados.append({
-
                 "par":par,
                 "score":score,
                 "tendencia":tendencia,
@@ -299,24 +306,21 @@ def escanear():
     log("TOP oportunidades")
 
     for m in mercados[:10]:
-
         log(f"{m['par']} score {m['score']} {m['tendencia']}")
 
     for m in mercados:
 
         if len(operaciones_abiertas) >= MAX_OPERACIONES:
-
             log("Máximo operaciones alcanzado")
-
             return
 
         if m["score"] >= SCORE_MINIMO:
-
             abrir_trade(m["par"],m["tendencia"],m["atr"])
 
-# ==========================================
+
+# ======================================
 # LOOP
-# ==========================================
+# ======================================
 
 log("BOT INICIADO")
 
@@ -325,8 +329,6 @@ while True:
     try:
 
         escanear()
-
-        trailing()
 
         log("Esperando 5 minutos")
 
