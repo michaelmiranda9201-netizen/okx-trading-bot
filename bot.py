@@ -1,222 +1,339 @@
-import time
-import hmac
-import base64
-import hashlib
+import os
 import requests
-import pandas as pd
 import numpy as np
-from datetime import datetime
+import time
+import okx.Trade as Trade
+import okx.Account as Account
 
-API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
-SECRET_KEY = "DD0B0C2024162F50F4267C1D59C4AC81"
-PASSPHRASE = "WXcv8089@"
+# ==========================================
+# CONFIGURACION
+# ==========================================
 
-BASE = "https://www.okx.com"
+API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
+SECRET_KEY = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
+PASSPHRASE = os.getenv("WXcv8089@")
 
-TRADE_SIZE = "1"
-MAX_TRADES = 2
+tradeAPI = Trade.TradeAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, "0")
+accountAPI = Account.AccountAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, "0")
 
-open_positions = {}
+BASE_URL = "https://www.okx.com"
 
-# firma API
+MAX_OPERACIONES = 2
+SCORE_MINIMO = 85
+RIESGO = 0.08
 
-def sign(timestamp, method, request_path, body):
+operaciones_abiertas = {}
 
-    message = str(timestamp) + method + request_path + body
-    mac = hmac.new(bytes(SECRET_KEY, encoding='utf8'), bytes(message, encoding='utf-8'), hashlib.sha256)
-    d = mac.digest()
+# ==========================================
+# LOG
+# ==========================================
 
-    return base64.b64encode(d)
+def log(msg):
+    print(f"[BOT] {msg}")
 
-# headers API
+# ==========================================
+# BALANCE
+# ==========================================
 
-def headers(method, path, body=""):
+def obtener_balance():
 
-    timestamp = datetime.utcnow().isoformat("T", "milliseconds") + "Z"
+    try:
+        data = accountAPI.get_account_balance()
 
-    signature = sign(timestamp, method, path, body)
+        for d in data['data'][0]['details']:
+            if d['ccy'] == 'USDT':
+                return float(d['availBal'])
 
-    return {
-        "OK-ACCESS-KEY": API_KEY,
-        "OK-ACCESS-SIGN": signature,
-        "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
-        "Content-Type": "application/json"
-    }
+    except:
+        pass
 
-# ejecutar orden
+    return 0
 
-def place_order(symbol, side):
+# ==========================================
+# PARES USDT
+# ==========================================
 
-    path = "/api/v5/trade/order"
+def obtener_pares():
 
-    url = BASE + path
-
-    body = {
-        "instId": symbol,
-        "tdMode": "isolated",
-        "side": side,
-        "ordType": "market",
-        "sz": TRADE_SIZE
-    }
-
-    r = requests.post(url, json=body, headers=headers("POST", path, str(body)))
-
-    print("ORDER:", r.text)
-
-# obtener pares
-
-def get_pairs():
-
-    url = BASE + "/api/v5/public/instruments?instType=SWAP"
+    url = BASE_URL + "/api/v5/public/instruments?instType=SWAP"
 
     r = requests.get(url).json()
 
-    pairs = []
+    pares = []
 
-    for p in r["data"]:
+    for i in r["data"]:
+        if "USDT" in i["instId"]:
+            pares.append(i["instId"])
 
-        if "USDT" in p["instId"]:
+    return pares
 
-            pairs.append(p["instId"])
+# ==========================================
+# VELAS
+# ==========================================
 
-    return pairs
+def obtener_velas(par):
 
-# velas
-
-def get_candles(symbol):
-
-    url = f"{BASE}/api/v5/market/candles?instId={symbol}&bar=1m&limit=120"
+    url = f"{BASE_URL}/api/v5/market/candles?instId={par}&bar=1H&limit=200"
 
     r = requests.get(url).json()
 
-    df = pd.DataFrame(r["data"])
+    data = r["data"]
 
-    df = df.iloc[::-1]
+    closes = [float(v[4]) for v in data]
+    highs = [float(v[2]) for v in data]
+    lows = [float(v[3]) for v in data]
 
-    df[1] = df[1].astype(float)
-    df[2] = df[2].astype(float)
-    df[3] = df[3].astype(float)
-    df[4] = df[4].astype(float)
-    df[5] = df[5].astype(float)
+    return closes, highs, lows
 
-    return df
-
+# ==========================================
 # EMA
+# ==========================================
 
-def ema(series,p):
+def ema(data, period):
 
-    return series.ewm(span=p).mean()
+    data = np.array(data)
 
+    weights = np.exp(np.linspace(-1.,0.,period))
+    weights /= weights.sum()
+
+    a = np.convolve(data,weights,mode='full')[:len(data)]
+    a[:period] = a[period]
+
+    return a
+
+# ==========================================
 # ATR
+# ==========================================
 
-def atr(df):
+def calcular_atr(highs,lows,closes):
 
-    tr = abs(df[2] - df[3])
+    trs = []
 
-    return tr.rolling(14).mean().iloc[-1]
+    for i in range(1,len(highs)):
 
-# score
+        tr = max(
+            highs[i]-lows[i],
+            abs(highs[i]-closes[i-1]),
+            abs(lows[i]-closes[i-1])
+        )
 
-def probability_score(df):
+        trs.append(tr)
+
+    return np.mean(trs[-14:])
+
+# ==========================================
+# ESTRUCTURA
+# ==========================================
+
+def estructura(highs,lows):
+
+    maximo = max(highs[-20:])
+    minimo = min(lows[-20:])
+
+    if highs[-1] > maximo:
+        return "LONG"
+
+    if lows[-1] < minimo:
+        return "SHORT"
+
+    return "RANGO"
+
+# ==========================================
+# ANALISIS
+# ==========================================
+
+def analizar(closes,highs,lows):
+
+    ema50 = ema(closes,50)[-1]
+    ema200 = ema(closes,200)[-1]
+
+    close = closes[-1]
 
     score = 0
-
-    ema50 = df["ema50"].iloc[-1]
-    ema200 = df["ema200"].iloc[-1]
-
-    volume = df[5]
-
-    vol_avg = volume.rolling(20).mean().iloc[-1]
+    tendencia = "NEUTRAL"
 
     if ema50 > ema200:
         score += 40
+        tendencia = "LONG"
 
     if ema50 < ema200:
         score += 40
+        tendencia = "SHORT"
 
-    if volume.iloc[-1] > vol_avg:
+    if close > ema50:
         score += 20
 
-    if abs(ema50-ema200) > df[4].iloc[-1]*0.001:
-        score += 20
+    bos = estructura(highs,lows)
 
-    return score
+    if bos == tendencia:
+        score += 25
 
-# abrir trade
+    atr = calcular_atr(highs,lows,closes)
 
-def trade(symbol, side):
+    return score,tendencia,atr
 
-    if len(open_positions) >= MAX_TRADES:
-        return
+# ==========================================
+# PRECIO
+# ==========================================
 
-    if symbol in open_positions:
-        return
+def precio_actual(par):
 
-    print("EXECUTING TRADE:", symbol, side)
+    url = f"{BASE_URL}/api/v5/market/ticker?instId={par}"
 
-    place_order(symbol, side)
+    r = requests.get(url).json()
 
-    open_positions[symbol] = side
+    return float(r["data"][0]["last"])
 
-# escaneo
+# ==========================================
+# ABRIR TRADE
+# ==========================================
 
-def scan_market():
+def abrir_trade(par,tendencia,atr):
 
-    pairs = get_pairs()
+    balance = obtener_balance()
 
-    volatility = []
+    tamaño = round(balance * RIESGO,2)
 
-    for p in pairs:
+    lado = "buy" if tendencia == "LONG" else "sell"
+
+    log(f"🚀 Ejecutando trade {par} {tendencia}")
+    log(f"Tamaño USDT {tamaño}")
+
+    try:
+
+        orden = tradeAPI.place_order(
+            instId=par,
+            tdMode="isolated",
+            side=lado,
+            ordType="market",
+            sz=str(tamaño)
+        )
+
+        log(f"Orden enviada {orden}")
+
+        operaciones_abiertas[par] = {
+
+            "lado":tendencia,
+            "atr":atr,
+            "sl":0
+        }
+
+    except Exception as e:
+
+        log(f"Error trade {e}")
+
+# ==========================================
+# TRAILING
+# ==========================================
+
+def trailing():
+
+    for par in operaciones_abiertas:
 
         try:
 
-            df = get_candles(p)
+            precio = precio_actual(par)
 
-            v = atr(df)
+            trade = operaciones_abiertas[par]
 
-            volatility.append((p,v))
+            if trade["lado"] == "LONG":
+
+                nuevo_sl = precio - trade["atr"]
+
+                if nuevo_sl > trade["sl"]:
+
+                    trade["sl"] = nuevo_sl
+
+                    log(f"Trailing actualizado {par}")
+
+            if trade["lado"] == "SHORT":
+
+                nuevo_sl = precio + trade["atr"]
+
+                if nuevo_sl < trade["sl"]:
+
+                    trade["sl"] = nuevo_sl
+
+                    log(f"Trailing actualizado {par}")
 
         except:
             pass
 
-    volatility.sort(key=lambda x: x[1],reverse=True)
+# ==========================================
+# ESCANEO
+# ==========================================
 
-    top_pairs = volatility[:25]
+def escanear():
 
-    for symbol,_ in top_pairs:
+    pares = obtener_pares()
+
+    mercados = []
+
+    log(f"Escaneando {len(pares)} pares")
+
+    for par in pares:
 
         try:
 
-            df = get_candles(symbol)
+            closes,highs,lows = obtener_velas(par)
 
-            df["ema50"] = ema(df[4],50)
-            df["ema200"] = ema(df[4],200)
+            score,tendencia,atr = analizar(closes,highs,lows)
 
-            score = probability_score(df)
+            mercados.append({
 
-            print(symbol,"score:",score)
-
-            if score < 85:
-                continue
-
-            if df["ema50"].iloc[-1] > df["ema200"].iloc[-1]:
-
-                trade(symbol,"buy")
-
-            elif df["ema50"].iloc[-1] < df["ema200"].iloc[-1]:
-
-                trade(symbol,"sell")
+                "par":par,
+                "score":score,
+                "tendencia":tendencia,
+                "atr":atr
+            })
 
         except:
             pass
 
-# loop
+    mercados = sorted(mercados,key=lambda x:x["atr"],reverse=True)
+
+    mercados = mercados[:25]
+
+    mercados = sorted(mercados,key=lambda x:x["score"],reverse=True)
+
+    log("TOP oportunidades")
+
+    for m in mercados[:10]:
+
+        log(f"{m['par']} score {m['score']} {m['tendencia']}")
+
+    for m in mercados:
+
+        if len(operaciones_abiertas) >= MAX_OPERACIONES:
+
+            log("Máximo operaciones alcanzado")
+
+            return
+
+        if m["score"] >= SCORE_MINIMO:
+
+            abrir_trade(m["par"],m["tendencia"],m["atr"])
+
+# ==========================================
+# LOOP
+# ==========================================
+
+log("BOT INICIADO")
 
 while True:
 
-    print("Scanning market...")
+    try:
 
-    scan_market()
+        escanear()
 
-    time.sleep(180)
+        trailing()
+
+        log("Esperando 5 minutos")
+
+        time.sleep(300)
+
+    except Exception as e:
+
+        log(f"Error controlado {e}")
+
+        time.sleep(60)
