@@ -45,62 +45,102 @@ def get_pairs():
     return df.sort_values("vol", ascending=False).head(3)["instId"].tolist()
 
 def get_klines(symbol):
-    r = requests.get(f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100").json()
+    r = requests.get(
+        f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100"
+    ).json()
+
     df = pd.DataFrame(r["data"])
     df = df.iloc[:, :6]
     df.columns = ["time","open","high","low","close","volume"]
+
     return df.astype(float)[::-1]
 
 # ========= BALANCE =========
 def get_balance():
     try:
-        r = requests.get(BASE_URL+"/api/v5/account/balance",
-                         headers=headers("GET","/api/v5/account/balance")).json()
+        r = requests.get(
+            BASE_URL+"/api/v5/account/balance",
+            headers=headers("GET","/api/v5/account/balance")
+        ).json()
+
+        log(f"📊 Balance raw: {r}")
 
         for d in r["data"][0]["details"]:
             if d["ccy"] == "USDT":
                 return float(d["availEq"])
-    except:
-        return None
+    except Exception as e:
+        log(f"❌ error balance: {e}")
 
-# ========= SIZE =========
-def get_size(balance, price):
+    return None
+
+# ========= LOT SIZE FIX =========
+def get_size(balance, price, symbol):
+
     size = (balance * RIESGO) / price
-    return max(round(size, 3), 0.001)
+
+    # lot sizes por símbolo (OKX)
+    lot_sizes = {
+        "BTC-USDT-SWAP": 0.001,
+        "ETH-USDT-SWAP": 0.01,
+        "SOL-USDT-SWAP": 0.1
+    }
+
+    lot = lot_sizes.get(symbol, 0.001)
+
+    # ajustar al múltiplo correcto
+    size = max(size, lot)
+    size = (size // lot) * lot
+
+    return round(size, 6)
 
 # ========= ORDEN =========
 def place(symbol, side, price, balance):
 
-    size = get_size(balance, price)
+    size = get_size(balance, price, symbol)
+
+    if size <= 0:
+        log("❌ tamaño inválido")
+        return
 
     body = json.dumps({
         "instId": symbol,
         "tdMode": MARGIN_MODE,
         "side": side,
-        "ordType": "market",   # 🔥 CAMBIO CLAVE
+        "ordType": "market",   # 🔥 ejecución inmediata
         "sz": str(size)
     })
 
-    r = requests.post(BASE_URL+"/api/v5/trade/order",
-                      headers=headers("POST","/api/v5/trade/order",body),
-                      data=body).json()
+    try:
+        r = requests.post(
+            BASE_URL+"/api/v5/trade/order",
+            headers=headers("POST","/api/v5/trade/order",body),
+            data=body
+        ).json()
 
-    log(f"📊 OKX RESPUESTA: {r}")
+        log(f"📊 OKX RESPUESTA: {r}")
+
+    except Exception as e:
+        log(f"❌ error orden: {e}")
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT FUNCIONAL OKX")
+    log("🚀 BOT OKX OPERATIVO (FIX LOT SIZE)")
 
     while True:
         try:
             balance = get_balance()
 
             if balance is None:
-                log("❌ error balance")
+                log("❌ no balance")
                 time.sleep(10)
                 continue
 
-            log(f"💰 Balance: {balance}")
+            log(f"💰 Balance REAL: {balance}")
+
+            if balance < 2:
+                log("⚠️ saldo muy bajo")
+                time.sleep(60)
+                continue
 
             pares = get_pairs()
 
@@ -109,7 +149,7 @@ def run():
                 df = get_klines(symbol)
                 price = df["close"].iloc[-1]
 
-                # 🔥 FORZAMOS TRADE PARA TEST
+                # 🔥 FORZAMOS BUY PARA TEST
                 side = "buy"
 
                 log(f"🔥 Ejecutando {symbol}")
