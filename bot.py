@@ -8,9 +8,9 @@ PASSPHRASE = "WXcv8089@"
 
 BASE_URL = "https://www.okx.com"
 
-SYMBOL = "BTC-USDT-SWAP"
+SYMBOL = "DOGE-USDT-SWAP"   # 🔥 PAR BARATO
+LEVERAGE = "10"            # 🔥 más eficiente
 RIESGO = 0.05
-LEVERAGE = "5"
 
 # ========= LOG =========
 def log(msg):
@@ -63,14 +63,10 @@ def set_leverage():
 
     log(f"⚙️ Leverage: {r}")
 
-# ========= SIZE (CONTRATOS) =========
+# ========= SIZE =========
 def get_contracts(balance):
-    contracts = int(balance * RIESGO)
-
-    if contracts < 1:
-        contracts = 1
-
-    return str(contracts)
+    # 🔥 siempre mínimo 1 contrato
+    return "1"
 
 # ========= ORDEN =========
 def place_order(side, balance):
@@ -97,7 +93,7 @@ def place_order(side, balance):
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT OKX FINAL (OPERATIVO REAL)")
+    log("🚀 BOT OKX SIMPLE (DOGE READY)")
 
     set_leverage()
 
@@ -112,8 +108,8 @@ def run():
 
             log(f"💰 Balance: {balance} USDT")
 
-            if balance < 5:
-                log("⚠️ saldo bajo")
+            if balance < 2:
+                log("⚠️ saldo muy bajo")
                 time.sleep(60)
                 continue
 
