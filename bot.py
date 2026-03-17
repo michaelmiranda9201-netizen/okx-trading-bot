@@ -15,8 +15,7 @@ BASE_URL = "https://www.okx.com"
 
 CAPITAL_INICIAL = 50
 RIESGO = 0.05
-TP_GLOBAL = 0.01
-SL_GLOBAL = -0.02
+TP_GLOBAL = 0.01   # SOLO TAKE PROFIT
 
 TIMEFRAME = "5m"
 MARGIN_MODE = "isolated"
@@ -118,15 +117,15 @@ def get_positions(symbol):
                      headers=headers("GET",f"/api/v5/account/positions?instId={symbol}")).json()
     return r.get("data", [])
 
-# ========= CERRAR =========
+# ========= CERRAR SOLO EN PROFIT =========
 
 def close_all(symbol):
-    log("🚨 CERRANDO TODAS LAS POSICIONES")
+    log("💰 CERRANDO EN TAKE PROFIT")
 
     positions = get_positions(symbol)
 
     for p in positions:
-        side = "sell" if p["pos"] and float(p["pos"]) > 0 else "buy"
+        side = "sell" if float(p["pos"]) > 0 else "buy"
 
         body = json.dumps({
             "instId": symbol,
@@ -161,7 +160,7 @@ def place(symbol, side, price, size):
 # ========= BOT =========
 
 def run():
-    log("💀 BOT MODO DINERO REAL CONTINUO")
+    log("💰 BOT GRID SOLO TP ACTIVO")
 
     while True:
         try:
@@ -170,20 +169,11 @@ def run():
 
             log(f"💰 Balance: {balance} | PnL: {round(pnl*100,2)}%")
 
-            # TP
+            # SOLO TAKE PROFIT
             if pnl >= TP_GLOBAL:
-                log("🎯 TP alcanzado")
-                pairs = get_pairs()
-                for p in pairs:
-                    close_all(p)
-                time.sleep(10)
-                continue
-
-            # SL
-            if pnl <= SL_GLOBAL:
-                log("🛑 SL activado")
-                pairs = get_pairs()
-                for p in pairs:
+                log("🎯 TAKE PROFIT ALCANZADO")
+                pares = get_pairs()
+                for p in pares:
                     close_all(p)
                 time.sleep(10)
                 continue
