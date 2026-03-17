@@ -14,160 +14,170 @@ BASE_URL = "https://www.okx.com"
 
 SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 
-CAPITAL = 50
-GRID_CAPITAL = 20
+GRID_CAPITAL = 15
+MAX_POSITIONS = 1
 
 # ========= AUTH =========
-def get_headers(method, path, body=""):
-    timestamp = str(time.time())
-    message = timestamp + method + path + body
-
-    signature = base64.b64encode(
-        hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256).digest()
+def headers(method, path, body=""):
+    ts = str(time.time())
+    msg = ts + method + path + body
+    sign = base64.b64encode(
+        hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
     ).decode()
 
     return {
         "OK-ACCESS-KEY": API_KEY,
-        "OK-ACCESS-SIGN": signature,
-        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-SIGN": sign,
+        "OK-ACCESS-TIMESTAMP": ts,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json"
     }
 
-# ========= MARKET =========
-def get_klines(instId):
-    url = f"{BASE_URL}/api/v5/market/candles?instId={instId}&bar=5m&limit=100"
+# ========= API =========
+def candles(symbol):
+    url = f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar=5m&limit=100"
     return requests.get(url).json()
 
-def get_price(instId):
-    url = f"{BASE_URL}/api/v5/market/ticker?instId={instId}"
+def price(symbol):
+    url = f"{BASE_URL}/api/v5/market/ticker?instId={symbol}"
     return float(requests.get(url).json()['data'][0]['last'])
 
-# ========= ACCOUNT =========
-def set_leverage(instId, lev):
+def set_leverage(symbol, lev):
     path = "/api/v5/account/set-leverage"
-    body = f'{{"instId":"{instId}","lever":"{lev}","mgnMode":"isolated"}}'
-    headers = get_headers("POST", path, body)
-    requests.post(BASE_URL + path, headers=headers, data=body)
+    body = f'{{"instId":"{symbol}","lever":"{lev}","mgnMode":"isolated"}}'
+    requests.post(BASE_URL + path, headers=headers("POST", path, body), data=body)
 
-# ========= STRATEGY =========
-def prepare_df(data):
+# ========= DATA =========
+def df_format(data):
     df = pd.DataFrame(data['data'])
     df = df.iloc[::-1]
-
-    df.columns = ["time","open","high","low","close","vol","volCcy","volCcyQuote","confirm"]
-
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-
+    df.columns = ["t","o","h","l","c","v","v2","v3","x"]
+    df["c"] = df["c"].astype(float)
+    df["h"] = df["h"].astype(float)
+    df["l"] = df["l"].astype(float)
     return df
 
 def indicators(df):
-    df["ema50"] = df["close"].ewm(span=50).mean()
-    df["ema200"] = df["close"].ewm(span=200).mean()
-    df["atr"] = (df["high"] - df["low"]).rolling(14).mean()
+    df["ema50"] = df["c"].ewm(span=50).mean()
+    df["ema200"] = df["c"].ewm(span=200).mean()
+    df["atr"] = (df["h"] - df["l"]).rolling(14).mean()
     return df
 
+# ========= FILTROS =========
+def is_lateral(df):
+    last = df.iloc[-1]
+    trend = abs(last["ema50"] - last["ema200"])
+    atr = last["atr"]
+
+    # filtro anti tendencia
+    if trend < atr * 2:
+        return True
+    return False
+
 def detect_range(df):
-    high = df["high"].rolling(50).max().iloc[-1]
-    low = df["low"].rolling(50).min().iloc[-1]
+    high = df["h"].rolling(50).max().iloc[-1]
+    low = df["l"].rolling(50).min().iloc[-1]
     return low, high
 
+# ========= GRID =========
 def build_grid(price, low, high, atr):
-    range_size = high - low
-
-    levels = int(range_size / (atr * 0.5))
-    levels = max(3, min(levels, 6))
-
-    step = range_size / levels
-
+    rng = high - low
+    levels = int(rng / (atr * 0.5))
+    levels = max(3, min(6, levels))
+    step = rng / levels
     return step, levels
 
-def dynamic_leverage(atr, price):
-    if atr / price > 0.01:
-        return 3
-    return 5
+def leverage(atr, price):
+    return 3 if atr/price > 0.01 else 5
 
-def dynamic_sl_tp(low, atr, step):
-    sl = low - atr * 1.2
-    tp = step * 0.7
-    return sl, tp
-
-# ========= EXECUTION =========
-def place_order(instId, side, price, size):
+# ========= ORDERS =========
+def order(symbol, side, px, sz):
     path = "/api/v5/trade/order"
-
     body = f'''
     {{
-        "instId": "{instId}",
-        "tdMode": "isolated",
-        "side": "{side}",
-        "ordType": "limit",
-        "px": "{price}",
-        "sz": "{size}"
+        "instId":"{symbol}",
+        "tdMode":"isolated",
+        "side":"{side}",
+        "ordType":"limit",
+        "px":"{px}",
+        "sz":"{sz}"
     }}
     '''
+    requests.post(BASE_URL + path, headers=headers("POST", path, body), data=body)
 
-    headers = get_headers("POST", path, body)
-    requests.post(BASE_URL + path, headers=headers, data=body)
+def stop_loss(symbol, sl):
+    path = "/api/v5/trade/order"
+    body = f'''
+    {{
+        "instId":"{symbol}",
+        "tdMode":"isolated",
+        "side":"sell",
+        "ordType":"market",
+        "slTriggerPx":"{sl}",
+        "slOrdPx":"-1"
+    }}
+    '''
+    requests.post(BASE_URL + path, headers=headers("POST", path, body), data=body)
 
-def place_grid(instId, price, step, levels):
+# ========= GRID EXEC =========
+def place_grid(symbol, price, step, levels):
     qty = GRID_CAPITAL / levels / price
 
-    for i in range(1, levels + 1):
+    for i in range(1, levels+1):
         buy = price - step * i
         sell = price + step * i
 
-        place_order(instId, "buy", round(buy, 2), round(qty, 3))
-        place_order(instId, "sell", round(sell, 2), round(qty, 3))
+        order(symbol, "buy", round(buy, 2), round(qty, 3))
+        order(symbol, "sell", round(sell, 2), round(qty, 3))
 
-# ========= MAIN =========
+# ========= BOT =========
 def run():
     while True:
-        best_symbol = None
-        best_vol = 0
+        best = None
+        best_atr = 0
 
-        # 🔍 Radar
-        for sym in SYMBOLS:
+        # 🔍 RADAR
+        for s in SYMBOLS:
             try:
-                data = get_klines(sym)
-                df = prepare_df(data)
-                df = indicators(df)
+                data = candles(s)
+                df = indicators(df_format(data))
+
+                if not is_lateral(df):
+                    continue
 
                 atr = df["atr"].iloc[-1]
 
-                if atr > best_vol:
-                    best_vol = atr
-                    best_symbol = sym
+                if atr > best_atr:
+                    best = s
+                    best_atr = atr
             except:
                 continue
 
-        if best_symbol:
-            print(f"\n🔥 OPERANDO: {best_symbol}")
+        if best:
+            print(f"\n🔥 TRADE: {best}")
 
-            data = get_klines(best_symbol)
-            df = prepare_df(data)
-            df = indicators(df)
+            data = candles(best)
+            df = indicators(df_format(data))
 
-            price = df["close"].iloc[-1]
+            price_now = df["c"].iloc[-1]
             atr = df["atr"].iloc[-1]
 
             low, high = detect_range(df)
-            step, levels = build_grid(price, low, high, atr)
+            step, levels = build_grid(price_now, low, high, atr)
 
-            lev = dynamic_leverage(atr, price)
-            set_leverage(best_symbol, lev)
+            lev = leverage(atr, price_now)
+            set_leverage(best, lev)
 
-            sl, tp = dynamic_sl_tp(low, atr, step)
+            sl = low - atr * 1.2
 
-            print(f"Precio: {price}")
-            print(f"Rango: {low} - {high}")
-            print(f"Grid: {levels} niveles | Step: {step}")
+            print(f"Precio: {price_now}")
+            print(f"Rango: {low}-{high}")
+            print(f"Grid: {levels}")
             print(f"Leverage: {lev}x")
-            print(f"SL: {sl} | TP: {tp}")
+            print(f"SL: {sl}")
 
-            place_grid(best_symbol, price, step, levels)
+            place_grid(best, price_now, step, levels)
+            stop_loss(best, sl)
 
         time.sleep(300)
 
