@@ -22,6 +22,8 @@ SL_GLOBAL = -0.03
 TIMEFRAME = "5m"
 MARGIN_MODE = "isolated"
 
+SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
+
 # ========= LOG =========
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -63,46 +65,58 @@ def headers(method, path, body=""):
 
 # ========= WEBSOCKET =========
 price_data = {}
+ws_connected = False
 
 def on_message(ws, message):
+    global price_data
     try:
         data = json.loads(message)
         if "data" in data:
             for d in data["data"]:
-                symbol = d["instId"]
-                price = float(d["last"])
-                price_data[symbol] = price
+                if "last" in d:
+                    symbol = d["instId"]
+                    price_data[symbol] = float(d["last"])
     except:
         pass
 
-def start_ws(symbols):
-    def run_ws():
+def on_open(ws):
+    global ws_connected
+    ws_connected = True
+    log("✅ WebSocket conectado")
+
+    args = [{"channel": "tickers", "instId": s} for s in SYMBOLS]
+
+    ws.send(json.dumps({
+        "op": "subscribe",
+        "args": args
+    }))
+
+def on_error(ws, error):
+    log(f"❌ WS Error: {error}")
+
+def on_close(ws, a, b):
+    global ws_connected
+    ws_connected = False
+    log("⚠️ WS desconectado, reconectando...")
+    time.sleep(5)
+    start_ws()
+
+def start_ws():
+    def run():
         ws = websocket.WebSocketApp(
             "wss://ws.okx.com:8443/ws/v5/public",
-            on_message=on_message
+            on_message=on_message,
+            on_open=on_open,
+            on_error=on_error,
+            on_close=on_close
         )
+        ws.run_forever(ping_interval=20, ping_timeout=10)
 
-        def on_open(ws):
-            args = [{"channel": "tickers", "instId": s} for s in symbols]
-            ws.send(json.dumps({"op": "subscribe", "args": args}))
-
-        ws.on_open = on_open
-        ws.run_forever()
-
-    t = threading.Thread(target=run_ws)
+    t = threading.Thread(target=run)
     t.daemon = True
     t.start()
 
 # ========= MARKET =========
-def get_pairs():
-    try:
-        r = requests.get(BASE_URL + "/api/v5/market/tickers?instType=SWAP", timeout=5)
-        df = pd.DataFrame(r.json()["data"])
-        df["vol"] = df["vol24h"].astype(float)
-        return df.sort_values("vol", ascending=False).head(3)["instId"].tolist()
-    except:
-        return []
-
 def get_klines(symbol):
     try:
         r = requests.get(f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100", timeout=5)
@@ -235,10 +249,9 @@ def close_all(symbol):
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT IA PRO ACTIVO")
+    log("🚀 BOT IA PRO (FIXED WS)")
 
-    pares = get_pairs()
-    start_ws(pares)
+    start_ws()
 
     while True:
         try:
@@ -249,55 +262,45 @@ def run():
 
             if pnl >= TP_GLOBAL:
                 log("🎯 TAKE PROFIT")
-                for p in pares:
-                    close_all(p)
+                for s in SYMBOLS:
+                    close_all(s)
                 time.sleep(30)
                 continue
 
             if pnl <= SL_GLOBAL:
                 log("🛑 STOP LOSS")
-                for p in pares:
-                    close_all(p)
+                for s in SYMBOLS:
+                    close_all(s)
                 time.sleep(60)
                 continue
 
-            mejor = None
+            for symbol in SYMBOLS:
 
-            for p in pares:
-                df = get_klines(p)
+                df = get_klines(symbol)
                 if df is None:
                     continue
 
                 signal = ai_signal(df)
-                if signal:
-                    mejor = (p, signal, df)
-                    break
+                if not signal:
+                    continue
 
-                time.sleep(0.3)
+                if len(get_positions(symbol)) > 0:
+                    continue
 
-            if not mejor:
-                log("⏳ Sin señal IA")
-                time.sleep(60)
-                continue
+                price = price_data.get(symbol)
 
-            symbol, signal, df = mejor
+                # 🔥 FALLBACK SI WS FALLA
+                if not price:
+                    log(f"⚠️ WS fallback {symbol}")
+                    price = df["close"].iloc[-1]
 
-            if len(get_positions(symbol)) > 0:
-                log("⏳ Ya hay trade")
-                time.sleep(60)
-                continue
+                log(f"🔥 {symbol} → {signal}")
 
-            price = price_data.get(symbol)
-            if not price:
-                log("⚠️ Esperando precio WS")
-                time.sleep(5)
-                continue
+                place(symbol, signal, price, balance)
 
-            log(f"🔥 {symbol} → {signal}")
+                break
 
-            place(symbol, signal, price, balance)
-
-            time.sleep(120)
+            time.sleep(60)
 
         except Exception as e:
             log(f"❌ ERROR: {e}")
