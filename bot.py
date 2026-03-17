@@ -25,7 +25,7 @@ ATR_PERIOD = 14
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ========= TIME FIX (CRÍTICO) =========
+# ========= TIME CACHE =========
 
 last_ts = None
 last_time = 0
@@ -34,14 +34,14 @@ def get_server_time_cached():
     global last_ts, last_time
     now = time.time()
 
-    if now - last_time > 2:
+    if last_ts is None or now - last_time > 5:
         try:
             url = "https://www.okx.com/api/v5/public/time"
             r = requests.get(url, timeout=5).json()
             last_ts = r["data"][0]["ts"]
             last_time = now
-        except:
-            pass
+        except Exception as e:
+            log(f"⚠️ Error obteniendo tiempo: {e}")
 
     return last_ts
 
@@ -56,9 +56,15 @@ def sign(ts, method, path, body=""):
 def headers(method, path, body=""):
     server_ts = get_server_time_cached()
 
-    ts = datetime.fromtimestamp(
-        int(server_ts)/1000, UTC
-    ).isoformat().replace("+00:00", "Z")
+    if server_ts is None:
+        raise Exception("No se pudo obtener tiempo de OKX")
+
+    # convertir a timestamp correcto con milisegundos EXACTOS
+    ts_sec = int(server_ts) / 1000
+    dt = datetime.fromtimestamp(ts_sec, UTC)
+
+    # FORMATO EXACTO requerido por OKX
+    ts = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
     return {
         "OK-ACCESS-KEY": API_KEY,
