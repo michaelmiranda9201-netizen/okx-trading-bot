@@ -12,7 +12,7 @@ PASSPHRASE = "WXcv8089@"
 
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
-TIMEFRAME = '1m'
+TARGET_PROFIT = 1.0  # 🔥 1 USDT
 RISK = 0.05
 
 # =========================
@@ -30,62 +30,62 @@ exchange = ccxt.okx({
 })
 
 # =========================
-# 📊 DATA + FILTROS PRO
+# 📊 DATA
 # =========================
 def get_data(symbol):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=150)
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=200)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
 
     df['ema20'] = df['close'].ewm(span=20).mean()
     df['ema50'] = df['close'].ewm(span=50).mean()
     df['atr'] = (df['high'] - df['low']).rolling(14).mean()
 
-    # 🔥 FUERZA DE TENDENCIA
-    df['momentum'] = df['close'].pct_change(5)
+    df['momentum'] = df['close'].pct_change(3)
+    df['vol_mean'] = df['volume'].rolling(20).mean()
 
     return df
 
 # =========================
-# 🧠 FILTRO INTELIGENTE
+# 🧠 IA PREDICTIVA
 # =========================
-def smart_signal(df):
+def ai_signal(df):
     last = df.iloc[-1]
 
+    # volumen anormal (acumulación)
+    vol_spike = last['volume'] > last['vol_mean'] * 1.8
+
+    # movimiento anticipado
+    momentum = last['momentum']
+
+    # tendencia base
     trend = "buy" if last['ema20'] > last['ema50'] else "sell"
 
-    # 🔥 FILTRO ANTI-LATERAL
-    if abs(last['momentum']) < 0.001:
-        return None
+    if vol_spike and abs(momentum) > 0.001:
+        return trend
 
-    return trend
-
-# =========================
-# 🧠 MEJOR PAR
-# =========================
-def choose_symbol():
-    best = None
-    best_score = 0
-
-    for s in SYMBOLS:
-        df = get_data(s)
-        atr = df['atr'].iloc[-1]
-        price = df['close'].iloc[-1]
-        momentum = abs(df['momentum'].iloc[-1])
-
-        score = (atr / price) + momentum
-
-        if score > best_score:
-            best_score = score
-            best = s
-
-    return best
+    return None
 
 # =========================
-# ⚙️ LEVERAGE DINÁMICO
+# 🐋 DETECTOR BALLENAS
+# =========================
+def whale_filter(df):
+    last = df.iloc[-1]
+
+    candle_range = last['high'] - last['low']
+    atr = last['atr']
+
+    # si vela muy grande → manipulación
+    if candle_range > atr * 2.5:
+        print("🐋 Ballena detectada - evitar entrada")
+        return False
+
+    return True
+
+# =========================
+# ⚙️ LEVERAGE
 # =========================
 def dynamic_leverage(atr, price):
     vol = atr / price
-
     if vol < 0.002:
         return 10
     elif vol < 0.005:
@@ -93,8 +93,16 @@ def dynamic_leverage(atr, price):
     else:
         return 5
 
+def set_leverage(symbol, lev):
+    cleanup(symbol)
+    exchange.set_leverage(
+        lev,
+        exchange.market(symbol)['id'],
+        params={"mgnMode": "isolated"}
+    )
+
 # =========================
-# 🧹 LIMPIEZA TOTAL
+# 🧹 CLEANUP
 # =========================
 def cleanup(symbol):
     try:
@@ -108,21 +116,8 @@ def cleanup(symbol):
             })
         except:
             pass
-
     except:
         pass
-
-# =========================
-# ⚙️ LEVERAGE
-# =========================
-def set_leverage(symbol, lev):
-    cleanup(symbol)
-
-    exchange.set_leverage(
-        lev,
-        exchange.market(symbol)['id'],
-        params={"mgnMode": "isolated"}
-    )
 
 # =========================
 # 💰 SIZE
@@ -150,7 +145,7 @@ def get_position(symbol):
     return None
 
 # =========================
-# 🚀 ENTRADA
+# 🚀 ENTRY
 # =========================
 def enter(symbol, side, size):
     exchange.create_order(
@@ -163,52 +158,54 @@ def enter(symbol, side, size):
     print(f"🚀 ENTRY {side} {symbol}")
 
 # =========================
-# 🎯 GESTIÓN ULTRA
+# 💰 MICRO PROFIT 1 USDT
 # =========================
-def manage(symbol, pos, atr):
+def manage(symbol, pos):
     entry = float(pos['entryPrice'])
     size = float(pos['contracts'])
     side = pos['side']
     mark = float(pos['markPrice'])
 
-    profit = (mark - entry) if side == "long" else (entry - mark)
+    pnl = (mark - entry) * size if side == "long" else (entry - mark) * size
 
-    # 🔥 BREAK EVEN
-    if profit > atr * 0.3:
-        sl = entry
-    else:
-        sl = entry - atr if side == "long" else entry + atr
+    print(f"💰 PnL actual: {pnl:.2f} USDT")
 
-    # 🔥 TRAILING PROFIT
-    tp = entry + atr if side == "long" else entry - atr
+    # 🔥 CIERRE EN 1 USDT
+    if pnl >= TARGET_PROFIT:
+        exit_side = "sell" if side == "long" else "buy"
 
-    exit_side = "sell" if side == "long" else "buy"
+        exchange.create_order(
+            symbol=symbol,
+            type="market",
+            side=exit_side,
+            amount=size,
+            params={"tdMode": "isolated"}
+        )
 
-    print(f"📊 Gestión | Profit: {profit:.2f}")
+        print("💵 GANANCIA ASEGURADA +1 USDT")
 
-    exchange.create_order(
-        symbol=symbol,
-        type="trigger",
-        side=exit_side,
-        amount=size,
-        price=tp,
-        params={"triggerPx": tp, "tdMode": "isolated"}
-    )
+# =========================
+# 🧠 MEJOR PAR
+# =========================
+def choose_symbol():
+    best = None
+    best_score = 0
 
-    exchange.create_order(
-        symbol=symbol,
-        type="trigger",
-        side=exit_side,
-        amount=size,
-        price=sl,
-        params={"triggerPx": sl, "tdMode": "isolated"}
-    )
+    for s in SYMBOLS:
+        df = get_data(s)
+        score = abs(df['momentum'].iloc[-1]) + (df['atr'].iloc[-1] / df['close'].iloc[-1])
+
+        if score > best_score:
+            best_score = score
+            best = s
+
+    return best
 
 # =========================
 # 🔁 LOOP
 # =========================
 def run():
-    print("💣 ULTRA DIOS RUNNING")
+    print("🧠 IA + 🐋 BOT ACTIVADO")
 
     while True:
         try:
@@ -217,10 +214,14 @@ def run():
             symbol = choose_symbol()
             df = get_data(symbol)
 
-            signal = smart_signal(df)
+            if not whale_filter(df):
+                time.sleep(20)
+                continue
+
+            signal = ai_signal(df)
 
             if signal is None:
-                print("⏸ Mercado lateral - no trade")
+                print("⏸ Sin señal IA")
                 time.sleep(20)
                 continue
 
@@ -236,9 +237,9 @@ def run():
                 size = size_calc(symbol, balance, price, lev)
                 enter(symbol, signal, size)
             else:
-                manage(symbol, pos, atr)
+                manage(symbol, pos)
 
-            time.sleep(25)
+            time.sleep(20)
 
         except Exception as e:
             print(f"❌ ERROR: {e}")
