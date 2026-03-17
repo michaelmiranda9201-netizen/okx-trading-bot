@@ -1,6 +1,6 @@
 import time, hmac, base64, hashlib, requests, pandas as pd, ta, os, json, traceback
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, UTC
 
 requests.packages.urllib3.disable_warnings()
 
@@ -15,6 +15,12 @@ AI_FILE = "ai_trades.json"
 MAX_TRADES = 3
 
 # =========================
+# 🕒 UTC MODERNO
+# =========================
+def utc_now():
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+# =========================
 # 🧠 IA SEGURA
 # =========================
 def load_ai():
@@ -24,10 +30,8 @@ def load_ai():
 
         with open(AI_FILE, "r") as f:
             content = f.read().strip()
-
             if not content:
                 return {"trades":[]}
-
             return json.loads(content)
 
     except Exception as e:
@@ -46,7 +50,7 @@ def log_trade(pair, result):
     data["trades"].append({
         "pair": pair,
         "result": result,
-        "time": str(datetime.utcnow())
+        "time": utc_now()
     })
     save_ai(data)
 
@@ -68,15 +72,15 @@ def sign(msg):
         hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).digest()
     ).decode()
 
-def headers(method,path,body=""):
-    ts=datetime.utcnow().isoformat()+"Z"
-    msg=ts+method+path+body
+def headers(method, path, body=""):
+    ts = utc_now()
+    msg = ts + method + path + body
     return {
-        "OK-ACCESS-KEY":API_KEY,
-        "OK-ACCESS-SIGN":sign(msg),
-        "OK-ACCESS-TIMESTAMP":ts,
-        "OK-ACCESS-PASSPHRASE":PASSPHRASE,
-        "Content-Type":"application/json"
+        "OK-ACCESS-KEY": API_KEY,
+        "OK-ACCESS-SIGN": sign(msg),
+        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+        "Content-Type": "application/json"
     }
 
 # =========================
@@ -84,14 +88,14 @@ def headers(method,path,body=""):
 # =========================
 def get_balance():
     try:
-        path="/api/v5/account/balance"
-        r=requests.get(BASE_URL+path,headers=headers("GET",path)).json()
+        path = "/api/v5/account/balance"
+        r = requests.get(BASE_URL + path, headers=headers("GET", path)).json()
 
         if "data" not in r:
             return 50
 
         for d in r["data"][0]["details"]:
-            if d["ccy"]=="USDT":
+            if d["ccy"] == "USDT":
                 return float(d["availBal"])
 
     except Exception as e:
@@ -104,16 +108,15 @@ def get_balance():
 # =========================
 def get_pairs():
     try:
-        data=requests.get(BASE_URL+"/api/v5/market/tickers?instType=SWAP").json().get("data",[])
-        pairs=[]
+        data = requests.get(BASE_URL + "/api/v5/market/tickers?instType=SWAP").json().get("data", [])
+        pairs = []
 
         for x in data:
             try:
                 if "USDT" not in x["instId"]:
                     continue
 
-                vol=float(x.get("volCcy24h",0))
-
+                vol = float(x.get("volCcy24h", 0))
                 if vol < 1000000:
                     continue
 
@@ -129,20 +132,20 @@ def get_pairs():
 
 def get_candles(pair):
     try:
-        data=requests.get(BASE_URL+f"/api/v5/market/candles?instId={pair}&bar=1H&limit=100").json().get("data",[])
+        data = requests.get(BASE_URL + f"/api/v5/market/candles?instId={pair}&bar=1H&limit=100").json().get("data", [])
 
         if not data:
             return None
 
-        df=pd.DataFrame(data,columns=["t","o","h","l","c","v","","",""])
+        df = pd.DataFrame(data, columns=["t","o","h","l","c","v","","",""])
 
-        df["c"]=df["c"].astype(float)
-        df["h"]=df["h"].astype(float)
-        df["l"]=df["l"].astype(float)
+        df["c"] = df["c"].astype(float)
+        df["h"] = df["h"].astype(float)
+        df["l"] = df["l"].astype(float)
 
-        df["ema50"]=ta.trend.ema_indicator(df["c"],50)
-        df["ema200"]=ta.trend.ema_indicator(df["c"],200)
-        df["atr"]=ta.volatility.average_true_range(df["h"],df["l"],df["c"],14)
+        df["ema50"] = ta.trend.ema_indicator(df["c"], 50)
+        df["ema200"] = ta.trend.ema_indicator(df["c"], 200)
+        df["atr"] = ta.volatility.average_true_range(df["h"], df["l"], df["c"], 14)
 
         return df
 
@@ -154,27 +157,29 @@ def get_candles(pair):
 # 🧠 LOGICA
 # =========================
 def modo(df):
-    e50=df["ema50"].iloc[-1]
-    e200=df["ema200"].iloc[-1]
+    e50 = df["ema50"].iloc[-1]
+    e200 = df["ema200"].iloc[-1]
 
-    if e50>e200:
+    if e50 > e200:
         return "LONG"
-    elif e50<e200:
+    elif e50 < e200:
         return "SHORT"
     return "NEUTRAL"
 
 def condicion(df):
     try:
-        precio=df["c"].iloc[-1]
+        precio = df["c"].iloc[-1]
 
         if precio == 0:
             return "NORMAL"
 
-        atr=df["atr"].iloc[-1]
-        v=atr/precio
+        atr = df["atr"].iloc[-1]
+        v = atr / precio
 
-        if v<0.002: return "BAJA"
-        elif v<0.006: return "NORMAL"
+        if v < 0.002:
+            return "BAJA"
+        elif v < 0.006:
+            return "NORMAL"
         return "ALTA"
 
     except:
@@ -182,14 +187,14 @@ def condicion(df):
 
 def score(df):
     try:
-        wr=winrate()
-        base=50
+        wr = winrate()
+        base = 50
 
-        if abs(df["ema50"].iloc[-1]-df["ema200"].iloc[-1])>0:
-            base+=20*wr
+        if abs(df["ema50"].iloc[-1] - df["ema200"].iloc[-1]) > 0:
+            base += 20 * wr
 
-        if df["atr"].iloc[-1]>df["c"].mean()*0.002:
-            base+=15*wr
+        if df["atr"].iloc[-1] > df["c"].mean() * 0.002:
+            base += 15 * wr
 
         return base
 
@@ -199,37 +204,37 @@ def score(df):
 # =========================
 # ⚙️ PARAMETROS
 # =========================
-def parametros(df,balance):
+def parametros(df, balance):
     try:
-        p=df["c"].iloc[-1]
-        atr=df["atr"].iloc[-1]
+        p = df["c"].iloc[-1]
+        atr = df["atr"].iloc[-1]
 
-        if atr==0:
-            atr=p*0.001
+        if atr == 0:
+            atr = p * 0.001
 
-        m=modo(df)
-        c=condicion(df)
+        m = modo(df)
+        c = condicion(df)
 
-        if c=="ALTA":
+        if c == "ALTA":
             return None
 
-        riesgo=0.01*balance
-        size=max(1,int(riesgo/atr))
+        riesgo = 0.01 * balance
+        size = max(1, int(riesgo / atr))
 
-        if m=="LONG":
-            tp=p+atr*2
-            sl=p-atr*1.5
-        elif m=="SHORT":
-            tp=p-atr*2
-            sl=p+atr*1.5
+        if m == "LONG":
+            tp = p + atr * 2
+            sl = p - atr * 1.5
+        elif m == "SHORT":
+            tp = p - atr * 2
+            sl = p + atr * 1.5
         else:
-            tp=p+atr
-            sl=p-atr
+            tp = p + atr
+            sl = p - atr
 
-        levels=5
-        step=(atr*3)/levels
+        levels = 5
+        step = (atr * 3) / levels
 
-        return m,tp,sl,levels,step,size
+        return m, tp, sl, levels, step, size
 
     except Exception as e:
         print("Error params:", e)
@@ -238,59 +243,59 @@ def parametros(df,balance):
 # =========================
 # 🚀 TRADING
 # =========================
-def order(pair,side,size):
+def order(pair, side, size):
     try:
-        body={
-            "instId":pair,
-            "tdMode":"cross",
-            "side":"buy" if side=="LONG" else "sell",
-            "ordType":"market",
-            "sz":str(size)
+        body = {
+            "instId": pair,
+            "tdMode": "cross",
+            "side": "buy" if side == "LONG" else "sell",
+            "ordType": "market",
+            "sz": str(size)
         }
 
-        requests.post(BASE_URL+"/api/v5/trade/order",
+        requests.post(BASE_URL + "/api/v5/trade/order",
                       json=body,
                       headers=headers("POST","/api/v5/trade/order",str(body)))
 
     except Exception as e:
         print("Error order:", e)
 
-def grid(pair,price,levels,step,side,size):
+def grid(pair, price, levels, step, side, size):
     try:
-        for i in range(1,levels+1):
-            px=price-step*i if side=="LONG" else price+step*i
+        for i in range(1, levels + 1):
+            px = price - step*i if side=="LONG" else price + step*i
 
-            body={
-                "instId":pair,
-                "tdMode":"cross",
-                "side":"buy" if side=="LONG" else "sell",
-                "ordType":"limit",
-                "px":str(round(px,4)),
-                "sz":str(size)
+            body = {
+                "instId": pair,
+                "tdMode": "cross",
+                "side": "buy" if side=="LONG" else "sell",
+                "ordType": "limit",
+                "px": str(round(px,4)),
+                "sz": str(size)
             }
 
-            requests.post(BASE_URL+"/api/v5/trade/order",
+            requests.post(BASE_URL + "/api/v5/trade/order",
                           json=body,
                           headers=headers("POST","/api/v5/trade/order",str(body)))
 
     except Exception as e:
         print("Error grid:", e)
 
-def tpsl(pair,tp,sl,side,size):
+def tpsl(pair, tp, sl, side, size):
     try:
-        body={
-            "instId":pair,
-            "tdMode":"cross",
-            "side":"sell" if side=="LONG" else "buy",
-            "ordType":"conditional",
-            "tpTriggerPx":str(tp),
-            "tpOrdPx":str(tp),
-            "slTriggerPx":str(sl),
-            "slOrdPx":str(sl),
-            "sz":str(size)
+        body = {
+            "instId": pair,
+            "tdMode": "cross",
+            "side": "sell" if side=="LONG" else "buy",
+            "ordType": "conditional",
+            "tpTriggerPx": str(tp),
+            "tpOrdPx": str(tp),
+            "slTriggerPx": str(sl),
+            "slOrdPx": str(sl),
+            "sz": str(size)
         }
 
-        requests.post(BASE_URL+"/api/v5/trade/order-algo",
+        requests.post(BASE_URL + "/api/v5/trade/order-algo",
                       json=body,
                       headers=headers("POST","/api/v5/trade/order-algo",str(body)))
 
