@@ -1,286 +1,176 @@
-import time, hmac, base64, hashlib, requests, pandas as pd, ta, os, json, traceback
-from dotenv import load_dotenv
-from datetime import datetime, UTC
-
-requests.packages.urllib3.disable_warnings()
-
-load_dotenv()
-
-API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
-SECRET = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
-PASSPHRASE = os.getenv("WXcv8089@")
-
-BASE_URL = "https://www.okx.com"
-AI_FILE = "ai_trades.json"
-MAX_TRADES = 3
+import ccxt
+import time
+import numpy as np
+import pandas as pd
 
 # =========================
-# 🟢 MODO AUTOMÁTICO
+# 🔐 CONFIGURACIÓN
 # =========================
-if not API_KEY or not SECRET or not PASSPHRASE:
-    print("⚠️ API no configurada → MODO SIMULACIÓN")
-    REAL_TRADING = False
-else:
-    print("✅ API detectada → MODO REAL")
-    REAL_TRADING = True
+API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
+API_SECRET = "DD0B0C2024162F50F4267C1D59C4AC81"
+PASSPHRASE = "WXcv8089@"
 
-# =========================
-# 🕒 UTC
-# =========================
-def utc_now():
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+
+TIMEFRAME = '1m'
+RISK_PER_TRADE = 0.05  # 5% del balance
+LEVERAGE_MAX = 10
+GRID_LEVELS = 5
 
 # =========================
-# 🔁 REQUEST SEGURO
+# 🔌 CONEXIÓN OKX
 # =========================
-def safe_request(method, url, headers=None, json_data=None, retries=3):
-    for i in range(retries):
-        try:
-            if method == "GET":
-                r = requests.get(url, headers=headers, timeout=10)
-            else:
-                r = requests.post(url, headers=headers, json=json_data, timeout=10)
-
-            return r.json()
-
-        except Exception as e:
-            print(f"⚠️ Error request intento {i+1}:", e)
-            time.sleep(2)
-
-    return {}
-
-# =========================
-# 🧠 IA SIMPLE
-# =========================
-def load_ai():
-    try:
-        if not os.path.exists(AI_FILE):
-            return {"trades":[]}
-
-        with open(AI_FILE, "r") as f:
-            content = f.read().strip()
-            if not content:
-                return {"trades":[]}
-            return json.loads(content)
-
-    except:
-        return {"trades":[]}
-
-def save_ai(data):
-    try:
-        with open(AI_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except:
-        pass
-
-def winrate():
-    data = load_ai()
-    trades = data["trades"]
-
-    if len(trades) < 5:
-        return 0.5
-
-    wins = len([t for t in trades if t["result"] == "win"])
-    return wins / len(trades)
-
-# =========================
-# 🔐 AUTH
-# =========================
-def sign(msg):
-    if not SECRET:
-        return ""
-    return base64.b64encode(
-        hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).digest()
-    ).decode()
-
-def headers(method, path, body=""):
-    ts = utc_now()
-    msg = ts + method + path + body
-    return {
-        "OK-ACCESS-KEY": API_KEY or "",
-        "OK-ACCESS-SIGN": sign(msg),
-        "OK-ACCESS-TIMESTAMP": ts,
-        "OK-ACCESS-PASSPHRASE": PASSPHRASE or "",
-        "Content-Type": "application/json"
+exchange = ccxt.okx({
+    'apiKey': API_KEY,
+    'secret': API_SECRET,
+    'password': PASSPHRASE,
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'swap'
     }
+})
 
 # =========================
-# 📊 DATOS
+# 📊 FUNCIONES
 # =========================
-def get_pairs():
-    data = safe_request("GET", BASE_URL + "/api/v5/market/tickers?instType=SWAP").get("data", [])
-    pairs = []
 
-    for x in data:
-        try:
-            if "USDT" not in x["instId"]:
-                continue
+def get_balance():
+    balance = exchange.fetch_balance()
+    return balance['USDT']['free']
 
-            vol = float(x.get("volCcy24h", 0))
-            if vol < 1000000:
-                continue
-
-            pairs.append(x["instId"])
-        except:
-            continue
-
-    return pairs
-
-def get_candles(pair):
-    data = safe_request("GET", BASE_URL + f"/api/v5/market/candles?instId={pair}&bar=1H&limit=100").get("data", [])
-
-    if not data:
-        return None
-
-    df = pd.DataFrame(data, columns=["t","o","h","l","c","v","","",""])
-
-    df["c"] = df["c"].astype(float)
-    df["h"] = df["h"].astype(float)
-    df["l"] = df["l"].astype(float)
-
-    df["ema50"] = ta.trend.ema_indicator(df["c"], 50)
-    df["ema200"] = ta.trend.ema_indicator(df["c"], 200)
-    df["atr"] = ta.volatility.average_true_range(df["h"], df["l"], df["c"], 14)
-
+def get_data(symbol):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
+    df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
     return df
 
-# =========================
-# 🧠 LOGICA
-# =========================
-def modo(df):
-    if df["ema50"].iloc[-1] > df["ema200"].iloc[-1]:
-        return "LONG"
-    elif df["ema50"].iloc[-1] < df["ema200"].iloc[-1]:
-        return "SHORT"
-    return "NEUTRAL"
+def calculate_indicators(df):
+    df['ema_fast'] = df['close'].ewm(span=20).mean()
+    df['ema_slow'] = df['close'].ewm(span=50).mean()
+    df['atr'] = (df['high'] - df['low']).rolling(14).mean()
+    return df
 
-def condicion(df):
-    precio = df["c"].iloc[-1]
-    if precio == 0:
-        return "NORMAL"
-
-    atr = df["atr"].iloc[-1]
-    v = atr / precio
-
-    if v < 0.002:
-        return "BAJA"
-    elif v < 0.006:
-        return "NORMAL"
-    return "ALTA"
-
-def score(df):
-    wr = winrate()
-    base = 50
-
-    if abs(df["ema50"].iloc[-1] - df["ema200"].iloc[-1]) > 0:
-        base += 20 * wr
-
-    if df["atr"].iloc[-1] > df["c"].mean() * 0.002:
-        base += 15 * wr
-
-    return base
-
-# =========================
-# ⚙️ PARAMETROS
-# =========================
-def parametros(df, balance):
-    p = df["c"].iloc[-1]
-    atr = df["atr"].iloc[-1]
-
-    if atr == 0:
-        atr = p * 0.001
-
-    if condicion(df) == "ALTA":
-        return None
-
-    m = modo(df)
-
-    riesgo = 0.01 * balance
-    size = max(1, int(riesgo / atr))
-
-    if m == "LONG":
-        tp = p + atr * 2
-        sl = p - atr * 1.5
-    elif m == "SHORT":
-        tp = p - atr * 2
-        sl = p + atr * 1.5
+def get_trend(df):
+    if df['ema_fast'].iloc[-1] > df['ema_slow'].iloc[-1]:
+        return "bullish"
     else:
-        tp = p + atr
-        sl = p - atr
+        return "bearish"
 
-    levels = 5
-    step = (atr * 3) / levels
+def calculate_leverage(atr, price):
+    vol = atr / price
+    lev = int(min(max(2, 1 / vol), LEVERAGE_MAX))
+    return lev
 
-    return m, tp, sl, levels, step, size
-
-# =========================
-# 🚀 TRADING
-# =========================
-def ejecutar_trade(pair, m, price, levels, step, size):
-    if not REAL_TRADING:
-        print(f"🧪 SIMULADO → {pair} {m} size:{size}")
-        return
-
-    body = {
-        "instId": pair,
-        "tdMode": "cross",
-        "side": "buy" if m=="LONG" else "sell",
-        "ordType": "market",
-        "sz": str(size)
-    }
-
-    safe_request("POST", BASE_URL + "/api/v5/trade/order",
-                 headers("POST","/api/v5/trade/order",str(body)),
-                 body)
-
-    for i in range(1, levels + 1):
-        px = price - step*i if m=="LONG" else price + step*i
-
-        grid_body = {
-            "instId": pair,
-            "tdMode": "cross",
-            "side": "buy" if m=="LONG" else "sell",
-            "ordType": "limit",
-            "px": str(round(px,4)),
-            "sz": str(size)
-        }
-
-        safe_request("POST", BASE_URL + "/api/v5/trade/order",
-                     headers("POST","/api/v5/trade/order",str(grid_body)),
-                     grid_body)
+def calculate_position_size(balance, price):
+    risk_amount = balance * RISK_PER_TRADE
+    size = risk_amount / price
+    return size
 
 # =========================
-# 🔁 LOOP
+# 📈 GRID DINÁMICO
 # =========================
-def run():
+
+def create_grid_orders(symbol, price, atr, trend, balance):
+    grid_spacing = atr * 0.5
+    orders = []
+
+    size = calculate_position_size(balance, price)
+
+    for i in range(1, GRID_LEVELS + 1):
+        if trend == "bullish":
+            buy_price = price - (grid_spacing * i)
+            tp = price + (grid_spacing * i)
+            sl = price - (atr * 2)
+
+            orders.append({
+                'side': 'buy',
+                'price': buy_price,
+                'tp': tp,
+                'sl': sl,
+                'size': size
+            })
+
+        else:
+            sell_price = price + (grid_spacing * i)
+            tp = price - (grid_spacing * i)
+            sl = price + (atr * 2)
+
+            orders.append({
+                'side': 'sell',
+                'price': sell_price,
+                'tp': tp,
+                'sl': sl,
+                'size': size
+            })
+
+    return orders
+
+# =========================
+# 🚀 EJECUCIÓN DE ÓRDENES
+# =========================
+
+def place_orders(symbol, orders, leverage):
+    try:
+        exchange.set_leverage(leverage, symbol)
+
+        for order in orders:
+            side = order['side']
+            price = order['price']
+            size = order['size']
+
+            print(f"📌 {symbol} | {side.upper()} | Precio: {price:.2f} | Size: {size:.6f}")
+
+            exchange.create_limit_order(
+                symbol=symbol,
+                side=side,
+                amount=size,
+                price=price,
+                params={
+                    "tdMode": "cross"
+                }
+            )
+
+    except Exception as e:
+        print(f"❌ Error orden: {e}")
+
+# =========================
+# 🔁 LOOP PRINCIPAL
+# =========================
+
+def run_bot():
     while True:
         try:
-            balance = 50
+            balance = get_balance()
+            print(f"\n💰 Balance: {balance:.2f} USDT")
 
-            pairs = get_pairs()
+            for symbol in SYMBOLS:
+                df = get_data(symbol)
+                df = calculate_indicators(df)
 
-            for p in pairs[:MAX_TRADES]:
-                df = get_candles(p)
-                if df is None:
-                    continue
+                price = df['close'].iloc[-1]
+                atr = df['atr'].iloc[-1]
+                trend = get_trend(df)
 
-                params = parametros(df, balance)
-                if not params:
-                    continue
+                leverage = calculate_leverage(atr, price)
 
-                m,tp,sl,levels,step,size = params
-                price = df["c"].iloc[-1]
+                print(f"\n📊 {symbol}")
+                print(f"Precio: {price}")
+                print(f"Tendencia: {trend}")
+                print(f"Leverage: x{leverage}")
 
-                print(f"🚀 {p} | {m} | size:{size}")
+                orders = create_grid_orders(symbol, price, atr, trend, balance)
 
-                ejecutar_trade(p, m, price, levels, step, size)
+                place_orders(symbol, orders, leverage)
 
-            time.sleep(300)
-
-        except Exception as e:
-            print("ERROR:", e)
-            traceback.print_exc()
+            # Espera 60 segundos
             time.sleep(60)
 
+        except Exception as e:
+            print(f"❌ Error general: {e}")
+            time.sleep(30)
+
+# =========================
+# ▶️ START
+# =========================
+
 if __name__ == "__main__":
-    run()
+    run_bot()
