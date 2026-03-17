@@ -1,234 +1,201 @@
-import os
 import time
-import json
-import hmac
-import base64
-import hashlib
 import requests
 import numpy as np
+import pandas as pd
+import hmac, base64, json
 from datetime import datetime
+
+# ========= CONFIG =========
+
+API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
+SECRET_KEY = "DD0B0C2024162F50F4267C1D59C4AC81"
+PASSPHRASE = "WXcv8089@"
 
 BASE_URL = "https://www.okx.com"
 
-API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
-SECRET_KEY = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
-PASSPHRASE = os.getenv("WXcv8089@")
+CAPITAL = 50
+RIESGO = 0.02
+TIMEFRAME = "5m"
 
-MAX_OPERACIONES = 2
-SCORE_MINIMO = 85
-RIESGO = 0.05
+MARGIN_MODE = "isolated"
+ATR_PERIOD = 14
 
-operaciones_abiertas = {}
+TP_GLOBAL = 0.015  # 1.5%
 
-# =========================
-# LOG
 # =========================
 
 def log(msg):
-    print(f"[PRO BOT] {msg}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-# =========================
-# FIRMA
-# =========================
+# ========= AUTH =========
 
-def firma(timestamp, method, path, body=""):
-    mensaje = f"{timestamp}{method}{path}{body}"
-    mac = hmac.new(SECRET_KEY.encode(), mensaje.encode(), hashlib.sha256)
-    return base64.b64encode(mac.digest()).decode()
+def sign(ts, method, path, body=""):
+    msg = f"{ts}{method}{path}{body}"
+    return base64.b64encode(hmac.new(SECRET_KEY.encode(), msg.encode(), digestmod="sha256").digest()).decode()
 
 def headers(method, path, body=""):
-    timestamp = datetime.utcnow().isoformat(timespec='milliseconds') + "Z"
-    sign = firma(timestamp, method, path, body)
-
+    ts = datetime.utcnow().isoformat() + "Z"
     return {
         "OK-ACCESS-KEY": API_KEY,
-        "OK-ACCESS-SIGN": sign,
-        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-SIGN": sign(ts, method, path, body),
+        "OK-ACCESS-TIMESTAMP": ts,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json"
     }
 
-# =========================
-# VELAS 5M
-# =========================
+# ========= MARKET =========
 
-def velas(par):
-    url = f"{BASE_URL}/api/v5/market/candles?instId={par}&bar=5m&limit=100"
+def get_pairs():
+    url = f"{BASE_URL}/api/v5/market/tickers?instType=SWAP"
     data = requests.get(url).json()["data"]
+    usdt = [p for p in data if "USDT" in p["instId"]]
+    df = pd.DataFrame(usdt)
+    df["vol"] = df["vol24h"].astype(float)
+    return df.sort_values("vol", ascending=False).head(10)["instId"].tolist()
 
-    closes = [float(v[4]) for v in data]
-    highs = [float(v[2]) for v in data]
-    lows = [float(v[3]) for v in data]
-    opens = [float(v[1]) for v in data]
+def get_klines(symbol):
+    url = f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100"
+    data = requests.get(url).json()["data"]
+    df = pd.DataFrame(data)
+    df = df.iloc[:, :6]
+    df.columns = ["time","open","high","low","close","volume"]
+    return df.astype(float)[::-1]
 
-    return closes, highs, lows, opens
+# ========= INDICADORES =========
 
-# =========================
-# EMA
-# =========================
+def ema(df,p): return df["close"].ewm(span=p).mean()
 
-def ema(data, period):
-    data = np.array(data)
-    weights = np.exp(np.linspace(-1.,0.,period))
-    weights /= weights.sum()
-    a = np.convolve(data,weights,mode='full')[:len(data)]
-    a[:period] = a[period]
-    return a
+def atr(df):
+    hl = df["high"] - df["low"]
+    hc = abs(df["high"] - df["close"].shift())
+    lc = abs(df["low"] - df["close"].shift())
+    return pd.Series(np.maximum(hl, np.maximum(hc, lc))).rolling(ATR_PERIOD).mean()
 
-# =========================
-# FILTRO WICK (ANTI MANIPULACION)
-# =========================
+# ========= IA SCORE =========
 
-def wick_fuerte(open_, close, high, low):
+def score(df):
+    e50 = ema(df,50).iloc[-1]
+    e200 = ema(df,200).iloc[-1]
+    price = df["close"].iloc[-1]
+    momentum = df["close"].pct_change().iloc[-5:].mean()
 
-    cuerpo = abs(close - open_)
-    mecha = (high - low)
+    s = 0
 
-    if cuerpo == 0:
-        return True
+    if e50 > e200: s += 30
+    if price > e50: s += 20
+    if momentum > 0: s += 20
 
-    ratio = mecha / cuerpo
+    vol = atr(df).iloc[-1] / price
+    if vol > 0.005: s += 15
 
-    return ratio > 2  # si hay mucha mecha = manipulación
+    return s
 
-# =========================
-# BREAKOUT REAL
-# =========================
+# ========= MANIPULACION =========
 
-def breakout_real(highs, lows, closes):
+def fake_breakout(df):
+    last = df.iloc[-1]
+    body = abs(last["close"] - last["open"])
+    wick = last["high"] - last["low"]
 
-    resistencia = max(highs[-15:-1])
-    soporte = min(lows[-15:-1])
+    return wick > body * 3
 
-    if closes[-1] > resistencia:
-        return "LONG"
+# ========= GRID =========
 
-    if closes[-1] < soporte:
-        return "SHORT"
+def grid(price, atr_val):
+    niveles = 7 if atr_val/price > 0.005 else 5
+    rango = atr_val * 1.5
+    paso = rango / niveles
+    return [price + (i - niveles//2)*paso for i in range(niveles)]
 
-    return "NONE"
+# ========= ORDENES =========
 
-# =========================
-# IMPULSO
-# =========================
-
-def impulso(closes):
-    return closes[-1] > closes[-3]
-
-# =========================
-# ANALISIS PRO
-# =========================
-
-def analizar(closes, highs, lows, opens):
-
-    ema50 = ema(closes,50)[-1]
-    ema200 = ema(closes,200)[-1]
-
-    score = 0
-    tendencia = "NEUTRAL"
-
-    if ema50 > ema200:
-        score += 30
-        tendencia = "LONG"
-
-    if ema50 < ema200:
-        score += 30
-        tendencia = "SHORT"
-
-    # Confirmación vela
-    if closes[-1] > opens[-1]:
-        score += 15
-
-    # Evitar manipulación
-    if not wick_fuerte(opens[-1], closes[-1], highs[-1], lows[-1]):
-        score += 20
-
-    # Breakout real
-    bo = breakout_real(highs, lows, closes)
-
-    if bo == tendencia:
-        score += 25
-
-    # Impulso
-    if impulso(closes):
-        score += 10
-
-    return score, tendencia
-
-# =========================
-# ABRIR TRADE
-# =========================
-
-def abrir_trade(par, tendencia):
-
-    size = 3  # fijo para cuenta pequeña
-
-    side = "buy" if tendencia == "LONG" else "sell"
-
+def place(symbol, side, price, size):
     path = "/api/v5/trade/order"
-
     body = json.dumps({
-        "instId": par,
-        "tdMode": "isolated",
+        "instId": symbol,
+        "tdMode": MARGIN_MODE,
         "side": side,
-        "ordType": "market",
+        "ordType": "limit",
+        "px": str(round(price,2)),
         "sz": str(size)
     })
+    requests.post(BASE_URL+path, headers=headers("POST",path,body), data=body)
 
-    r = requests.post(
-        BASE_URL + path,
-        headers=headers("POST", path, body),
-        data=body
-    )
+def cancel_all(symbol):
+    path = f"/api/v5/trade/orders-pending?instId={symbol}"
+    r = requests.get(BASE_URL+path, headers=headers("GET",path)).json()
 
-    log(f"🚀 TRADE REAL {par} {tendencia}")
-    log(r.json())
+    for o in r.get("data", []):
+        body = json.dumps({"instId":symbol,"ordId":o["ordId"]})
+        requests.post(BASE_URL+"/api/v5/trade/cancel-order",
+                      headers=headers("POST","/api/v5/trade/cancel-order",body),
+                      data=body)
 
-# =========================
-# ESCANEO
-# =========================
+# ========= TP GLOBAL =========
 
-def escanear():
+balance_inicial = CAPITAL
 
-    pares = requests.get(BASE_URL + "/api/v5/public/instruments?instType=SWAP").json()["data"]
+def check_tp(balance):
+    return (balance - balance_inicial) / balance_inicial >= TP_GLOBAL
 
-    lista = [p["instId"] for p in pares if "USDT" in p["instId"]]
+# ========= BOT =========
 
-    for par in lista:
+def run():
+    log("😈 MODO DIOS ACTIVADO")
 
+    activo = None
+    niveles = None
+
+    while True:
         try:
+            pares = get_pairs()
 
-            closes, highs, lows, opens = velas(par)
+            mejor = None
+            best_score = 0
 
-            score, tendencia = analizar(closes, highs, lows, opens)
+            for p in pares:
+                df = get_klines(p)
 
-            if score >= SCORE_MINIMO:
+                if fake_breakout(df):
+                    continue
 
-                log(f"{par} SCORE {score} {tendencia}")
+                s = score(df)
 
-                abrir_trade(par, tendencia)
+                if s > best_score:
+                    best_score = s
+                    mejor = p
 
-        except:
-            pass
+            if best_score < 70:
+                log("❌ Sin oportunidades fuertes")
+                time.sleep(60)
+                continue
 
-# =========================
-# LOOP
-# =========================
+            df = get_klines(mejor)
+            price = df["close"].iloc[-1]
+            atr_val = atr(df).iloc[-1]
 
-log("BOT NIVEL 8 PRO INICIADO")
+            if activo != mejor or niveles is None or price < min(niveles) or price > max(niveles):
+                log(f"🚀 {mejor} SCORE {best_score}")
+                cancel_all(mejor)
 
-while True:
+                niveles = grid(price, atr_val)
+                size = round((CAPITAL*RIESGO)/price,4)
 
-    try:
+                for n in niveles:
+                    if n < price:
+                        place(mejor,"buy",n,size)
+                    else:
+                        place(mejor,"sell",n,size)
 
-        escanear()
+                activo = mejor
 
-        log("Esperando 2 minutos...")
+            log(f"⏳ {mejor} trabajando...")
 
-        time.sleep(120)
+            time.sleep(60)
 
-    except Exception as e:
+        except Exception as e:
+            log(f"❌ Error: {e}")
+            time.sleep(30)
 
-        log(f"Error {e}")
-
-        time.sleep(60)
+if __name__ == "__main__":
+    run()
