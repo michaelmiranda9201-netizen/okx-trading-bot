@@ -14,7 +14,6 @@ SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 TIMEFRAME = '1m'
 RISK_PER_TRADE = 0.05
 GRID_LEVELS = 3
-LEVERAGE_MAX = 10
 
 # =========================
 # 🔌 OKX
@@ -24,7 +23,10 @@ exchange = ccxt.okx({
     'secret': API_SECRET,
     'password': PASSPHRASE,
     'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}
+    'options': {
+        'defaultType': 'swap',
+        'defaultMarginMode': 'isolated'  # 🔥 FORZAR AISLADO
+    }
 })
 
 # =========================
@@ -41,10 +43,35 @@ def get_data(symbol):
 def trend(df):
     return "buy" if df['ema20'].iloc[-1] > df['ema50'].iloc[-1] else "sell"
 
+# =========================
+# ⚙️ LEVERAGE DINÁMICO REAL
+# =========================
 def dynamic_leverage(atr, price):
     vol = atr / price
-    lev = int(min(max(3, 1/vol), LEVERAGE_MAX))
-    return lev
+
+    if vol < 0.002:
+        return 10
+    elif vol < 0.005:
+        return 7
+    elif vol < 0.01:
+        return 5
+    else:
+        return 3
+
+def set_leverage(symbol, leverage):
+    try:
+        market = exchange.market(symbol)
+
+        exchange.set_leverage(
+            leverage,
+            market['id'],
+            params={"mgnMode": "isolated"}
+        )
+
+        print(f"⚙️ {symbol} → Leverage x{leverage} AISLADO")
+
+    except Exception as e:
+        print(f"❌ Error leverage: {e}")
 
 # =========================
 # 💰 BALANCE
@@ -53,11 +80,12 @@ def get_balance():
     return exchange.fetch_balance()['USDT']['free']
 
 # =========================
-# 📏 SIZE OKX
+# 📏 SIZE OKX CORRECTO
 # =========================
 def calculate_size(symbol, balance, price, leverage):
     risk = balance * RISK_PER_TRADE
     position_value = risk * leverage
+
     size = position_value / price
 
     if size < 0.01:
@@ -66,19 +94,9 @@ def calculate_size(symbol, balance, price, leverage):
     return float(exchange.amount_to_precision(symbol, size))
 
 # =========================
-# ⚙️ LEVERAGE REAL OKX
-# =========================
-def set_leverage(symbol, leverage):
-    try:
-        market = exchange.market(symbol)
-        exchange.set_leverage(leverage, market['id'], params={"mgnMode": "cross"})
-    except Exception as e:
-        print(f"❌ Error leverage: {e}")
-
-# =========================
 # 📊 POSICIONES
 # =========================
-def get_positions(symbol):
+def get_position(symbol):
     try:
         positions = exchange.fetch_positions([symbol])
         for p in positions:
@@ -100,45 +118,40 @@ def cancel_orders(symbol):
         pass
 
 # =========================
-# 📈 CREAR GRID
+# 📈 GRID INTELIGENTE
 # =========================
 def create_grid(price, atr, side):
     spacing = atr * 0.5
-    grid = []
+    levels = []
 
     for i in range(1, GRID_LEVELS + 1):
         if side == "buy":
-            entry = price - spacing * i
+            levels.append(price - spacing * i)
         else:
-            entry = price + spacing * i
+            levels.append(price + spacing * i)
 
-        grid.append(entry)
+    return levels
 
-    return grid
-
-# =========================
-# 🚀 PONER GRID
-# =========================
-def place_grid(symbol, grid, size):
+def place_grid(symbol, levels, size):
     try:
-        for entry in grid:
-            side = "buy" if entry < grid[0] else "sell"
+        for price in levels:
+            side = "buy" if price < levels[0] else "sell"
 
-            print(f"📌 GRID {symbol} | {side.upper()} | {entry:.2f}")
+            print(f"📌 GRID {symbol} | {side.upper()} | {price:.2f}")
 
             exchange.create_order(
                 symbol=symbol,
                 type="limit",
                 side=side,
                 amount=size,
-                price=entry,
-                params={"tdMode": "cross"}
+                price=price,
+                params={"tdMode": "isolated"}  # 🔥 AISLADO
             )
     except Exception as e:
         print(f"❌ Grid error: {e}")
 
 # =========================
-# 🎯 TP / SL SOLO SI HAY POSICIÓN
+# 🎯 TP / SL PROFESIONAL
 # =========================
 def manage_position(symbol, position, atr):
     try:
@@ -155,26 +168,32 @@ def manage_position(symbol, position, atr):
             sl = entry + atr * 2
             exit_side = "buy"
 
-        print(f"🎯 TP/SL {symbol} | TP: {tp:.2f} | SL: {sl:.2f}")
+        print(f"🎯 {symbol} TP: {tp:.2f} | SL: {sl:.2f}")
 
-        # TP
+        # TAKE PROFIT
         exchange.create_order(
             symbol=symbol,
             type="trigger",
             side=exit_side,
             amount=size,
             price=tp,
-            params={"triggerPx": tp, "tdMode": "cross"}
+            params={
+                "triggerPx": tp,
+                "tdMode": "isolated"
+            }
         )
 
-        # SL
+        # STOP LOSS
         exchange.create_order(
             symbol=symbol,
             type="trigger",
             side=exit_side,
             amount=size,
             price=sl,
-            params={"triggerPx": sl, "tdMode": "cross"}
+            params={
+                "triggerPx": sl,
+                "tdMode": "isolated"
+            }
         )
 
     except Exception as e:
@@ -184,7 +203,7 @@ def manage_position(symbol, position, atr):
 # 🔁 BOT LOOP
 # =========================
 def run():
-    print("🚀 BOT GRID PROFESIONAL OKX")
+    print("🚀 BOT GRID PRO | OKX FUTUROS AISLADO")
 
     while True:
         try:
@@ -202,20 +221,19 @@ def run():
                 print(f"\n📊 {symbol}")
                 print(f"Precio: {price}")
                 print(f"Tendencia: {side}")
-                print(f"Leverage: x{leverage}")
+                print(f"Leverage dinámico: x{leverage}")
 
                 set_leverage(symbol, leverage)
 
                 size = calculate_size(symbol, balance, price, leverage)
 
-                # 🔍 VER SI YA HAY POSICIÓN
-                position = get_positions(symbol)
+                position = get_position(symbol)
 
                 if position:
-                    print("✅ Posición activa detectada")
+                    print("✅ Posición activa")
                     manage_position(symbol, position, atr)
                 else:
-                    print("📈 Creando GRID nuevo")
+                    print("📈 Nuevo GRID")
                     cancel_orders(symbol)
                     grid = create_grid(price, atr, side)
                     place_grid(symbol, grid, size)
