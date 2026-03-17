@@ -1,10 +1,8 @@
-import time
+import time, json, os, hmac, base64, threading, traceback
 import requests
-import numpy as np
 import pandas as pd
-import hmac, base64, json, os, traceback
+import numpy as np
 import websocket
-import threading
 from datetime import datetime, UTC
 
 # ========= CONFIG =========
@@ -14,61 +12,25 @@ PASSPHRASE = os.getenv("WXcv8089@")
 
 BASE_URL = "https://www.okx.com"
 
-CAPITAL_INICIAL = 50
-RIESGO = 0.02
-TP_GLOBAL = 0.01
-SL_GLOBAL = -0.03
+SYMBOLS = ["BTC-USDT-SWAP","ETH-USDT-SWAP","SOL-USDT-SWAP"]
+
+RIESGO = 0.01
+MAX_EXPOSURE = 0.3   # 30% del capital máximo en mercado
+TP_GLOBAL = 0.015
+SL_GLOBAL = -0.025
 
 TIMEFRAME = "5m"
 MARGIN_MODE = "isolated"
 
-SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
+price_data = {}
+ws_thread = None
 
 # ========= LOG =========
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ========= TIME =========
-last_ts = None
-last_time = 0
-
-def get_server_time():
-    global last_ts, last_time
-    try:
-        if last_ts is None or time.time() - last_time > 5:
-            r = requests.get(BASE_URL + "/api/v5/public/time", timeout=5)
-            last_ts = int(r.json()["data"][0]["ts"])
-            last_time = time.time()
-        return last_ts
-    except:
-        return int(time.time() * 1000)
-
-# ========= AUTH =========
-def sign(ts, method, path, body=""):
-    msg = f"{ts}{method}{path}{body}"
-    return base64.b64encode(
-        hmac.new(SECRET_KEY.encode(), msg.encode(), digestmod="sha256").digest()
-    ).decode()
-
-def headers(method, path, body=""):
-    ts_sec = int(get_server_time()) / 1000
-    dt = datetime.fromtimestamp(ts_sec, UTC)
-    ts = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-
-    return {
-        "OK-ACCESS-KEY": API_KEY,
-        "OK-ACCESS-SIGN": sign(ts, method, path, body),
-        "OK-ACCESS-TIMESTAMP": ts,
-        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
-        "Content-Type": "application/json"
-    }
-
-# ========= WEBSOCKET =========
-price_data = {}
-ws_connected = False
-
+# ========= WS =========
 def on_message(ws, message):
-    global price_data
     try:
         data = json.loads(message)
         if "data" in data:
@@ -79,66 +41,50 @@ def on_message(ws, message):
         pass
 
 def on_open(ws):
-    global ws_connected
-    ws_connected = True
-    log("✅ WebSocket conectado")
+    log("✅ WS conectado")
+    args = [{"channel":"tickers","instId":s} for s in SYMBOLS]
+    ws.send(json.dumps({"op":"subscribe","args":args}))
 
-    args = [{"channel": "tickers", "instId": s} for s in SYMBOLS]
-
-    ws.send(json.dumps({
-        "op": "subscribe",
-        "args": args
-    }))
-
-def on_error(ws, error):
-    log(f"❌ WS Error: {error}")
-
-def on_close(ws, a, b):
-    global ws_connected
-    ws_connected = False
-    log("⚠️ WS desconectado, reconectando...")
-    time.sleep(5)
-    start_ws()
+def on_close(ws, code, msg):
+    log(f"⚠️ WS cerrado {code}")
 
 def start_ws():
-    def run():
-        ws = websocket.WebSocketApp(
-            "wss://ws.okx.com:8443/ws/v5/public",
-            on_message=on_message,
-            on_open=on_open,
-            on_error=on_error,
-            on_close=on_close
-        )
-        ws.run_forever(ping_interval=20, ping_timeout=10)
+    global ws_thread
 
-    t = threading.Thread(target=run)
-    t.daemon = True
-    t.start()
+    if ws_thread and ws_thread.is_alive():
+        return
+
+    def run():
+        while True:
+            try:
+                ws = websocket.WebSocketApp(
+                    "wss://ws.okx.com:8443/ws/v5/public",
+                    on_message=on_message,
+                    on_open=on_open,
+                    on_close=on_close
+                )
+                ws.run_forever(ping_interval=20)
+            except Exception as e:
+                log(f"WS error {e}")
+
+            time.sleep(5)
+
+    ws_thread = threading.Thread(target=run)
+    ws_thread.daemon = True
+    ws_thread.start()
 
 # ========= MARKET =========
 def get_klines(symbol):
     try:
-        r = requests.get(
-            f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100",
-            timeout=5
-        )
-        data = r.json()
-
-        if "data" not in data:
-            return None
-
-        df = pd.DataFrame(data["data"])
-        if df.empty:
-            return None
-
+        r = requests.get(f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100", timeout=5)
+        df = pd.DataFrame(r.json()["data"])
         df = df.iloc[:, :6]
         df.columns = ["time","open","high","low","close","volume"]
         return df.astype(float)[::-1]
-
     except:
         return None
 
-# ========= IA =========
+# ========= IA INSTITUCIONAL =========
 def ai_signal(df):
     try:
         if df is None or df.empty:
@@ -149,28 +95,17 @@ def ai_signal(df):
         ema50 = close.ewm(span=50).mean().iloc[-1]
         ema200 = close.ewm(span=200).mean().iloc[-1]
 
-        momentum = close.pct_change().iloc[-10:].mean()
-        volatility = df["high"].iloc[-1] - df["low"].iloc[-1]
+        trend = "bull" if ema50 > ema200 else "bear"
 
-        prob_buy = 0
-        prob_sell = 0
+        momentum = close.pct_change().iloc[-5:].mean()
 
-        prob_buy += 0.4 if ema50 > ema200 else 0
-        prob_sell += 0.4 if ema50 <= ema200 else 0
+        structure = close.iloc[-1] > close.iloc[-3]
 
-        prob_buy += 0.3 if momentum > 0 else 0
-        prob_sell += 0.3 if momentum <= 0 else 0
-
-        if volatility > close.iloc[-1] * 0.003:
-            prob_buy += 0.1
-            prob_sell += 0.1
-
-        prob_buy += 0.2 if close.iloc[-1] > close.iloc[-3] else 0
-        prob_sell += 0.2 if close.iloc[-1] <= close.iloc[-3] else 0
-
-        if prob_buy > 0.6:
+        # filtro institucional
+        if trend == "bull" and momentum > 0 and structure:
             return "buy"
-        elif prob_sell > 0.6:
+
+        if trend == "bear" and momentum < 0 and not structure:
             return "sell"
 
         return None
@@ -178,61 +113,43 @@ def ai_signal(df):
     except:
         return None
 
-# ========= MARTINGALA =========
-martingale_step = 0
-MAX_MARTINGALA = 3
-
-def get_size(balance, price):
-    if price is None or price <= 0:
-        return 0
-
-    base = (balance * RIESGO) / price
-    multiplier = 1.5 ** martingale_step
-    return round(base * multiplier, 3)
-
-# ========= BALANCE =========
+# ========= RIESGO =========
 def get_balance():
     try:
-        r = requests.get(
-            BASE_URL+"/api/v5/account/balance",
-            headers=headers("GET","/api/v5/account/balance"),
-            timeout=5
-        )
-        data = r.json()
-
-        if "data" not in data:
-            return CAPITAL_INICIAL
-
-        for d in data["data"][0]["details"]:
+        r = requests.get(BASE_URL+"/api/v5/account/balance",
+                         headers=headers("GET","/api/v5/account/balance"), timeout=5)
+        for d in r.json()["data"][0]["details"]:
             if d["ccy"] == "USDT":
                 return float(d["eq"])
-
     except:
-        pass
+        return 50
 
-    return CAPITAL_INICIAL
+def get_size(balance, price):
+    if not price:
+        return 0
+    return round((balance * RIESGO) / price, 3)
 
-# ========= POSICIONES =========
-def get_positions(symbol):
-    try:
-        r = requests.get(
-            BASE_URL+f"/api/v5/account/positions?instId={symbol}",
-            headers=headers("GET",f"/api/v5/account/positions?instId={symbol}"),
-            timeout=5
-        )
-        return r.json().get("data", [])
-    except:
-        return []
+# ========= AUTH =========
+def sign(ts, method, path, body=""):
+    msg = f"{ts}{method}{path}{body}"
+    return base64.b64encode(
+        hmac.new(SECRET_KEY.encode(), msg.encode(), digestmod="sha256").digest()
+    ).decode()
 
-# ========= ORDEN =========
+def headers(method, path, body=""):
+    ts = datetime.utcnow().isoformat("T","milliseconds")+"Z"
+    return {
+        "OK-ACCESS-KEY": API_KEY,
+        "OK-ACCESS-SIGN": sign(ts, method, path, body),
+        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+        "Content-Type": "application/json"
+    }
+
+# ========= TRADE =========
 def place(symbol, side, price, balance):
-    if price is None or price <= 0:
-        log("❌ Precio inválido, no trade")
-        return
-
     size = get_size(balance, price)
     if size <= 0:
-        log("❌ Tamaño inválido")
         return
 
     body = json.dumps({
@@ -244,99 +161,52 @@ def place(symbol, side, price, balance):
     })
 
     try:
-        r = requests.post(
-            BASE_URL+"/api/v5/trade/order",
-            headers=headers("POST","/api/v5/trade/order",body),
-            data=body,
-            timeout=5
-        )
-        data = r.json()
-        log(f"{symbol} {side} → {data.get('code')} size:{size}")
+        r = requests.post(BASE_URL+"/api/v5/trade/order",
+                          headers=headers("POST","/api/v5/trade/order",body),
+                          data=body, timeout=5)
+        log(f"🔥 {symbol} {side} ejecutado")
     except:
-        log("❌ Error enviando orden")
-
-# ========= CERRAR =========
-def close_all(symbol):
-    positions = get_positions(symbol)
-
-    for p in positions:
-        try:
-            pos = float(p["pos"])
-            if pos == 0:
-                continue
-
-            side = "sell" if pos > 0 else "buy"
-
-            body = json.dumps({
-                "instId": symbol,
-                "tdMode": MARGIN_MODE,
-                "side": side,
-                "ordType": "market",
-                "sz": str(abs(pos))
-            })
-
-            requests.post(
-                BASE_URL+"/api/v5/trade/order",
-                headers=headers("POST","/api/v5/trade/order",body),
-                data=body,
-                timeout=5
-            )
-        except:
-            pass
+        log("❌ error orden")
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT IA PRO (ULTRA STABLE)")
+    log("🏦 BOT INSTITUCIONAL ACTIVO")
 
     start_ws()
 
     while True:
         try:
             balance = get_balance()
+            pnl = (balance - 50) / 50
 
-            if balance <= 0:
-                log("⚠️ Balance inválido")
-                time.sleep(10)
+            log(f"💰 {balance} USDT | PnL {round(pnl*100,2)}%")
+
+            # KILL SWITCH
+            if pnl <= SL_GLOBAL:
+                log("🛑 KILL SWITCH ACTIVADO")
+                time.sleep(300)
                 continue
-
-            pnl = (balance - CAPITAL_INICIAL) / CAPITAL_INICIAL
-            log(f"💰 Balance: {balance} | PnL: {round(pnl*100,2)}%")
 
             if pnl >= TP_GLOBAL:
-                log("🎯 TAKE PROFIT")
-                for s in SYMBOLS:
-                    close_all(s)
-                time.sleep(30)
-                continue
-
-            if pnl <= SL_GLOBAL:
-                log("🛑 STOP LOSS")
-                for s in SYMBOLS:
-                    close_all(s)
-                time.sleep(60)
+                log("🎯 TAKE PROFIT GLOBAL")
+                time.sleep(120)
                 continue
 
             for symbol in SYMBOLS:
 
                 df = get_klines(symbol)
-                if df is None or df.empty:
-                    log(f"⚠️ Sin datos {symbol}")
+                if df is None:
                     continue
 
                 signal = ai_signal(df)
                 if not signal:
                     continue
 
-                if len(get_positions(symbol)) > 0:
-                    continue
-
                 price = price_data.get(symbol)
-
-                if price is None:
-                    log(f"⚠️ WS fallback {symbol}")
+                if not price:
                     price = df["close"].iloc[-1]
 
-                log(f"🔥 {symbol} → {signal}")
+                log(f"📡 {symbol} → {signal}")
 
                 place(symbol, signal, price, balance)
 
@@ -344,11 +214,9 @@ def run():
 
             time.sleep(60)
 
-        except Exception:
-            log("❌ ERROR DETALLADO:")
+        except:
             log(traceback.format_exc())
             time.sleep(30)
 
-# ========= START =========
 if __name__ == "__main__":
     run()
