@@ -1,5 +1,5 @@
 requests
 pandas
 numpy
-okx
-websocket-client
+ta
+python-dotenv
