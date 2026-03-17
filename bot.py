@@ -15,10 +15,12 @@ BASE_URL = "https://www.okx.com"
 
 CAPITAL_INICIAL = 50
 RIESGO = 0.05
-TP_GLOBAL = 0.01
-SL_GLOBAL = -0.02
+TP_GLOBAL = 0.01     # +1%
+SL_GLOBAL = -0.02    # -2%
 
+SYMBOL = "BTC-USDT-SWAP"
 TIMEFRAME = "5m"
+
 MARGIN_MODE = "isolated"
 
 # ========= LOG =========
@@ -31,12 +33,16 @@ def log(msg):
 last_ts = None
 last_time = 0
 
-def get_server_time():
+def get_server_time_cached():
     global last_ts, last_time
-    if last_ts is None or time.time() - last_time > 5:
-        r = requests.get(BASE_URL + "/api/v5/public/time").json()
+    now = time.time()
+
+    if last_ts is None or now - last_time > 5:
+        url = "https://www.okx.com/api/v5/public/time"
+        r = requests.get(url).json()
         last_ts = r["data"][0]["ts"]
-        last_time = time.time()
+        last_time = now
+
     return last_ts
 
 # ========= AUTH =========
@@ -48,7 +54,7 @@ def sign(ts, method, path, body=""):
     ).decode()
 
 def headers(method, path, body=""):
-    ts_sec = int(get_server_time()) / 1000
+    ts_sec = int(get_server_time_cached()) / 1000
     dt = datetime.fromtimestamp(ts_sec, UTC)
     ts = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
@@ -60,68 +66,68 @@ def headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-# ========= MARKET =========
-
-def get_pairs():
-    r = requests.get(BASE_URL + "/api/v5/market/tickers?instType=SWAP").json()
-    df = pd.DataFrame(r["data"])
-    df["vol"] = df["vol24h"].astype(float)
-    return df.sort_values("vol", ascending=False).head(5)["instId"].tolist()
-
-def get_klines(symbol):
-    r = requests.get(f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100").json()
-    df = pd.DataFrame(r["data"])
-    df = df.iloc[:, :6]
-    df.columns = ["time","open","high","low","close","volume"]
-    return df.astype(float)[::-1]
-
-# ========= INDICADORES =========
-
-def ema(df, p):
-    return df["close"].ewm(span=p).mean()
-
-def atr(df):
-    return (df["high"] - df["low"]).rolling(14).mean()
-
-# ========= IA SCORE =========
-
-def score(df):
-    e50 = ema(df,50).iloc[-1]
-    e200 = ema(df,200).iloc[-1]
-    price = df["close"].iloc[-1]
-    momentum = df["close"].pct_change().iloc[-5:].mean()
-
-    s = 0
-    if e50 > e200: s += 30
-    if price > e50: s += 20
-    if momentum > 0: s += 20
-
-    vol = atr(df).iloc[-1] / price
-    if vol > 0.005: s += 20
-
-    return s
-
 # ========= BALANCE =========
 
 def get_balance():
-    r = requests.get(BASE_URL+"/api/v5/account/balance", headers=headers("GET","/api/v5/account/balance")).json()
-    for d in r["data"][0]["details"]:
-        if d["ccy"] == "USDT":
-            return float(d["eq"])
+    path = "/api/v5/account/balance"
+    r = requests.get(BASE_URL + path, headers=headers("GET", path)).json()
+
+    try:
+        for acc in r["data"][0]["details"]:
+            if acc["ccy"] == "USDT":
+                return float(acc["eq"])
+    except:
+        return CAPITAL_INICIAL
+
     return CAPITAL_INICIAL
 
 # ========= POSICIONES =========
 
-def get_positions(symbol):
-    r = requests.get(BASE_URL+f"/api/v5/account/positions?instId={symbol}",
-                     headers=headers("GET",f"/api/v5/account/positions?instId={symbol}")).json()
+def get_positions():
+    path = f"/api/v5/account/positions?instId={SYMBOL}"
+    r = requests.get(BASE_URL + path, headers=headers("GET", path)).json()
     return r.get("data", [])
+
+# ========= CERRAR TODO =========
+
+def close_all():
+    log("🚨 CERRANDO TODAS LAS POSICIONES")
+
+    positions = get_positions()
+
+    for p in positions:
+        side = "sell" if p["posSide"] == "long" else "buy"
+
+        body = json.dumps({
+            "instId": SYMBOL,
+            "tdMode": MARGIN_MODE,
+            "side": side,
+            "ordType": "market",
+            "sz": p["pos"]
+        })
+
+        requests.post(BASE_URL+"/api/v5/trade/order",
+                      headers=headers("POST","/api/v5/trade/order",body),
+                      data=body)
+
+# ========= GRID =========
+
+def get_klines():
+    url = f"{BASE_URL}/api/v5/market/candles?instId={SYMBOL}&bar={TIMEFRAME}&limit=100"
+    data = requests.get(url).json()["data"]
+
+    df = pd.DataFrame(data)
+    df.columns = ["time","open","high","low","close","volume","x","y","z"]
+    return df.astype(float)[::-1]
+
+def atr(df):
+    return (df["high"] - df["low"]).rolling(14).mean()
 
 # ========= ORDEN =========
 
-def place(symbol, side, price, size):
+def place(side, price, size):
     body = json.dumps({
-        "instId": symbol,
+        "instId": SYMBOL,
         "tdMode": MARGIN_MODE,
         "side": side,
         "ordType": "limit",
@@ -129,16 +135,14 @@ def place(symbol, side, price, size):
         "sz": str(size)
     })
 
-    r = requests.post(BASE_URL+"/api/v5/trade/order",
-                      headers=headers("POST","/api/v5/trade/order",body),
-                      data=body).json()
-
-    log(f"{symbol} {side} → {r.get('code')}")
+    requests.post(BASE_URL+"/api/v5/trade/order",
+                  headers=headers("POST","/api/v5/trade/order",body),
+                  data=body)
 
 # ========= BOT =========
 
 def run():
-    log("🔥 BOT PRO MULTI-PAR ACTIVADO")
+    log("💰 MODO DINERO REAL ACTIVADO")
 
     while True:
         try:
@@ -147,50 +151,42 @@ def run():
 
             log(f"💰 Balance: {balance} | PnL: {round(pnl*100,2)}%")
 
+            # TP / SL
             if pnl >= TP_GLOBAL:
-                log("🎯 TP alcanzado")
+                log("🎯 TAKE PROFIT ALCANZADO")
+                close_all()
                 break
 
             if pnl <= SL_GLOBAL:
-                log("🛑 SL alcanzado")
+                log("🛑 STOP LOSS ACTIVADO")
+                close_all()
                 break
 
-            pares = get_pairs()
-
-            mejor = None
-            mejor_score = 0
-
-            for p in pares:
-                df = get_klines(p)
-                s = score(df)
-
-                if s > mejor_score:
-                    mejor_score = s
-                    mejor = p
-
-            if mejor_score < 60:
-                log("⏳ Sin oportunidades fuertes")
+            # evitar sobreoperar
+            if get_positions():
+                log("⏳ Ya hay posición activa")
                 time.sleep(60)
                 continue
 
-            if get_positions(mejor):
-                log("⏳ Ya hay trade activo")
-                time.sleep(60)
-                continue
-
-            df = get_klines(mejor)
+            df = get_klines()
             price = df["close"].iloc[-1]
             atr_val = atr(df).iloc[-1]
 
+            rango = atr_val * 1.5
             niveles = 5
-            paso = (atr_val * 1.5) / niveles
+            paso = rango / niveles
 
-            log(f"🚀 Operando {mejor} SCORE {mejor_score}")
+            size = 0.01
+
+            log("🚀 NUEVO GRID")
 
             for i in range(niveles):
                 level = price + (i - niveles//2)*paso
-                side = "buy" if level < price else "sell"
-                place(mejor, side, level, 0.01)
+
+                if level < price:
+                    place("buy", level, size)
+                else:
+                    place("sell", level, size)
 
             time.sleep(120)
 
