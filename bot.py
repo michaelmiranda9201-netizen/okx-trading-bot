@@ -1,10 +1,10 @@
-import time, json, hmac, base64, requests
+import time, json, hmac, base64, requests, math
 from datetime import datetime, UTC
 
 # ========= CONFIG =========
 API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
 SECRET_KEY = "DD0B0C2024162F50F4267C1D59C4AC81"
-PASSPHRASE = "WXcv8089@"
+PASSPHRASE ="WXcv8089@"
 
 BASE_URL = "https://www.okx.com"
 
@@ -37,7 +37,7 @@ def headers(method, path, body=""):
 def get_balance():
     try:
         r = requests.get(
-            BASE_URL+"/api/v5/account/balance",
+            BASE_URL + "/api/v5/account/balance",
             headers=headers("GET","/api/v5/account/balance")
         ).json()
 
@@ -71,15 +71,20 @@ def set_leverage():
 
     log(f"⚙️ Leverage: {r}")
 
-# ========= SIZE =========
+# ========= SIZE (FIX REAL) =========
 def get_size(balance, price):
     size = (balance * RIESGO) / price
 
     lot = 0.001  # BTC
-    size = max(size, lot)
-    size = (size // lot) * lot
 
-    return round(size, 6)
+    steps = math.floor(size / lot)
+    size = steps * lot
+
+    if size < lot:
+        size = lot
+
+    # 🔥 devolver string exacto (sin error float)
+    return format(size, ".6f")
 
 # ========= ORDEN =========
 def place_order(side, balance):
@@ -87,26 +92,28 @@ def place_order(side, balance):
     price = get_price()
     size = get_size(balance, price)
 
+    log(f"📦 size calculado: {size}")
+
     body = json.dumps({
         "instId": SYMBOL,
         "tdMode": "isolated",
         "side": side,
         "posSide": "long" if side == "buy" else "short",
         "ordType": "market",
-        "sz": str(size)
+        "sz": size
     })
 
     r = requests.post(
-        BASE_URL+"/api/v5/trade/order",
+        BASE_URL + "/api/v5/trade/order",
         headers=headers("POST","/api/v5/trade/order",body),
         data=body
     ).json()
 
-    log(f"📊 {r}")
+    log(f"📊 OKX RESPUESTA: {r}")
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT SIMPLE OKX")
+    log("🚀 BOT FINAL OKX (FIXED)")
 
     set_leverage()
 
@@ -119,20 +126,22 @@ def run():
                 time.sleep(10)
                 continue
 
-            log(f"💰 {balance} USDT")
+            log(f"💰 Balance: {balance} USDT")
 
             if balance < 5:
                 log("⚠️ saldo bajo")
                 time.sleep(60)
                 continue
 
-            # 🔥 TEST: compra cada ciclo
+            log("🚨 ENVIANDO ORDEN")
+
+            # 🔥 puedes cambiar a "sell" para probar short
             place_order("buy", balance)
 
             time.sleep(60)
 
         except Exception as e:
-            log(f"❌ {e}")
+            log(f"❌ ERROR: {e}")
             time.sleep(10)
 
 # ========= START =========
