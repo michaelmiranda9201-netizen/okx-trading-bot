@@ -14,13 +14,11 @@ PASSPHRASE = "WXcv8089@"
 BASE_URL = "https://www.okx.com"
 
 CAPITAL = 50
-RIESGO = 0.02
+RIESGO = 0.05   # subimos un poco para que sí ejecute
 TIMEFRAME = "5m"
 
 MARGIN_MODE = "isolated"
 ATR_PERIOD = 14
-
-TP_GLOBAL = 0.015  # 1.5%
 
 # =========================
 
@@ -47,20 +45,9 @@ def headers(method, path, body=""):
 
 # ========= MARKET =========
 
-def get_pairs():
-    try:
-        url = f"{BASE_URL}/api/v5/market/tickers?instType=SWAP"
-        data = requests.get(url, timeout=10).json()["data"]
-        usdt = [p for p in data if "USDT" in p["instId"]]
-        df = pd.DataFrame(usdt)
-        df["vol"] = df["vol24h"].astype(float)
-        return df.sort_values("vol", ascending=False).head(10)["instId"].tolist()
-    except:
-        return []
-
 def get_klines(symbol):
     url = f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100"
-    data = requests.get(url, timeout=10).json()["data"]
+    data = requests.get(url).json()["data"]
     df = pd.DataFrame(data)
     df = df.iloc[:, :6]
     df.columns = ["time","open","high","low","close","volume"]
@@ -76,171 +63,87 @@ def atr(df):
     lc = abs(df["low"] - df["close"].shift())
     return pd.Series(np.maximum(hl, np.maximum(hc, lc))).rolling(ATR_PERIOD).mean()
 
-# ========= IA SCORE =========
+# ========= PRECISION =========
 
-def score(df):
-    try:
-        e50 = ema(df,50).iloc[-1]
-        e200 = ema(df,200).iloc[-1]
-        price = df["close"].iloc[-1]
-        momentum = df["close"].pct_change().iloc[-5:].mean()
+def format_price(price):
+    if price > 100:
+        return round(price, 2)
+    elif price > 1:
+        return round(price, 3)
+    elif price > 0.01:
+        return round(price, 4)
+    else:
+        return round(price, 6)
 
-        s = 0
-        if e50 > e200: s += 30
-        if price > e50: s += 20
-        if momentum > 0: s += 20
-
-        vol = atr(df).iloc[-1] / price
-        if vol > 0.005: s += 15
-
-        return s
-    except:
-        return 0
-
-# ========= MANIPULACION =========
-
-def fake_breakout(df):
-    last = df.iloc[-1]
-    body = abs(last["close"] - last["open"])
-    wick = last["high"] - last["low"]
-    return wick > body * 3
-
-# ========= GRID =========
-
-def build_grid(price, atr_val):
-    if np.isnan(atr_val) or atr_val == 0:
-        return []
-
-    niveles = 7 if atr_val/price > 0.005 else 5
-    rango = atr_val * 1.5
-    paso = rango / niveles
-
-    return [price + (i - niveles//2)*paso for i in range(niveles)]
-
-# ========= ORDENES =========
+# ========= ORDEN =========
 
 def place(symbol, side, price, size):
     try:
-        path = "/api/v5/trade/order"
+        if price <= 0:
+            return
+
+        px = format_price(price)
+
+        posSide = "long" if side == "buy" else "short"
+
         body = json.dumps({
             "instId": symbol,
             "tdMode": MARGIN_MODE,
             "side": side,
+            "posSide": posSide,
             "ordType": "limit",
-            "px": str(round(price,2)),
+            "px": str(px),
             "sz": str(size)
         })
 
-        requests.post(BASE_URL+path, headers=headers("POST",path,body), data=body, timeout=10)
-        log(f"{symbol} {side.upper()} @ {round(price,2)}")
+        r = requests.post(
+            BASE_URL + "/api/v5/trade/order",
+            headers=headers("POST","/api/v5/trade/order",body),
+            data=body
+        ).json()
+
+        log(f"{symbol} {side.upper()} @ {px} | resp: {r}")
 
     except Exception as e:
-        log(f"❌ Error orden: {e}")
+        log(f"Error orden: {e}")
 
-def cancel_all(symbol):
-    try:
-        path = f"/api/v5/trade/orders-pending?instId={symbol}"
-        r = requests.get(BASE_URL+path, headers=headers("GET",path), timeout=10).json()
-
-        for o in r.get("data", []):
-            body = json.dumps({"instId":symbol,"ordId":o["ordId"]})
-            requests.post(
-                BASE_URL+"/api/v5/trade/cancel-order",
-                headers=headers("POST","/api/v5/trade/cancel-order",body),
-                data=body,
-                timeout=10
-            )
-
-        log("🧹 Órdenes canceladas")
-
-    except Exception as e:
-        log(f"❌ Error cancelando: {e}")
-
-# ========= TP GLOBAL =========
-
-balance_inicial = CAPITAL
-
-def check_tp(balance):
-    return (balance - balance_inicial) / balance_inicial >= TP_GLOBAL
-
-# ========= BOT =========
+# ========= BOT SIMPLE TEST =========
 
 def run():
-    log("😈 MODO DIOS ACTIVADO (CORREGIDO)")
-
-    activo = None
-    niveles = None
+    symbol = "BTC-USDT-SWAP"
 
     while True:
         try:
-            pares = get_pairs()
+            df = get_klines(symbol)
 
-            if not pares:
-                log("⚠️ No hay pares disponibles")
-                time.sleep(60)
-                continue
-
-            mejor = None
-            best_score = 0
-
-            for p in pares:
-                df = get_klines(p)
-
-                if fake_breakout(df):
-                    continue
-
-                s = score(df)
-
-                if s > best_score:
-                    best_score = s
-                    mejor = p
-
-            if mejor is None or best_score < 70:
-                log("❌ Sin oportunidades fuertes")
-                time.sleep(60)
-                continue
-
-            df = get_klines(mejor)
             price = df["close"].iloc[-1]
             atr_val = atr(df).iloc[-1]
 
             if np.isnan(atr_val):
-                log("⚠️ ATR inválido")
-                time.sleep(60)
+                time.sleep(30)
                 continue
 
-            if activo != mejor or niveles is None or price < min(niveles) or price > max(niveles):
-                log(f"🚀 {mejor} SCORE {best_score}")
+            niveles = 5
+            rango = atr_val * 1.5
+            paso = rango / niveles
 
-                cancel_all(mejor)
+            grid = [price + (i - niveles//2)*paso for i in range(niveles)]
 
-                niveles = build_grid(price, atr_val)
+            size = max(0.001, round((CAPITAL * RIESGO) / price, 3))
 
-                if not niveles:
-                    log("⚠️ Grid vacío")
-                    time.sleep(60)
-                    continue
+            log("🚀 colocando grid real")
 
-                size = round((CAPITAL*RIESGO)/price,4)
+            for n in grid:
+                if n < price:
+                    place(symbol, "buy", n, size)
+                else:
+                    place(symbol, "sell", n, size)
 
-                for n in niveles:
-                    if n < price:
-                        place(mejor,"buy",n,size)
-                    else:
-                        place(mejor,"sell",n,size)
-
-                activo = mejor
-
-            else:
-                log(f"⏳ {mejor} activo en grid")
-
-            time.sleep(60)
+            time.sleep(120)
 
         except Exception as e:
-            log(f"❌ Error general: {e}")
+            log(f"ERROR: {e}")
             time.sleep(30)
-
-# ========= START =========
 
 if __name__ == "__main__":
     run()
