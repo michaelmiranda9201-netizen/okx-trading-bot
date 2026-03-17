@@ -1,10 +1,9 @@
 import ccxt
 import time
-import numpy as np
 import pandas as pd
 
 # =========================
-# 🔐 CONFIGURACIÓN
+# 🔐 CONFIG
 # =========================
 API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
 API_SECRET = "DD0B0C2024162F50F4267C1D59C4AC81"
@@ -18,7 +17,7 @@ GRID_LEVELS = 3
 LEVERAGE_MAX = 10
 
 # =========================
-# 🔌 CONEXIÓN OKX
+# 🔌 OKX
 # =========================
 exchange = ccxt.okx({
     'apiKey': API_KEY,
@@ -29,19 +28,11 @@ exchange = ccxt.okx({
 })
 
 # =========================
-# 📊 FUNCIONES
+# 📊 DATA
 # =========================
-
-def get_balance():
-    balance = exchange.fetch_balance()
-    return balance['USDT']['free']
-
 def get_data(symbol):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
-    return df
-
-def indicators(df):
     df['ema20'] = df['close'].ewm(span=20).mean()
     df['ema50'] = df['close'].ewm(span=50).mean()
     df['atr'] = (df['high'] - df['low']).rolling(14).mean()
@@ -56,26 +47,50 @@ def dynamic_leverage(atr, price):
     return lev
 
 # =========================
-# 💰 TAMAÑO CORRECTO OKX
+# 💰 BALANCE
 # =========================
+def get_balance():
+    return exchange.fetch_balance()['USDT']['free']
 
+# =========================
+# 📏 SIZE OKX
+# =========================
 def calculate_size(symbol, balance, price, leverage):
     risk = balance * RISK_PER_TRADE
     position_value = risk * leverage
-
     size = position_value / price
 
-    min_size = 0.01
-    if size < min_size:
-        size = min_size
+    if size < 0.01:
+        size = 0.01
 
-    size = float(exchange.amount_to_precision(symbol, size))
-    return size
+    return float(exchange.amount_to_precision(symbol, size))
 
 # =========================
-# 🧹 LIMPIAR ÓRDENES
+# ⚙️ LEVERAGE REAL OKX
 # =========================
+def set_leverage(symbol, leverage):
+    try:
+        market = exchange.market(symbol)
+        exchange.set_leverage(leverage, market['id'], params={"mgnMode": "cross"})
+    except Exception as e:
+        print(f"❌ Error leverage: {e}")
 
+# =========================
+# 📊 POSICIONES
+# =========================
+def get_positions(symbol):
+    try:
+        positions = exchange.fetch_positions([symbol])
+        for p in positions:
+            if float(p['contracts']) > 0:
+                return p
+    except:
+        pass
+    return None
+
+# =========================
+# 🧹 CANCELAR ÓRDENES
+# =========================
 def cancel_orders(symbol):
     try:
         orders = exchange.fetch_open_orders(symbol)
@@ -87,46 +102,29 @@ def cancel_orders(symbol):
 # =========================
 # 📈 CREAR GRID
 # =========================
-
-def create_grid(symbol, price, atr, side, balance, leverage):
-    orders = []
+def create_grid(price, atr, side):
     spacing = atr * 0.5
-
-    size = calculate_size(symbol, balance, price, leverage)
-
-    if size < 0.01:
-        print(f"⚠️ Tamaño muy pequeño {symbol}")
-        return []
+    grid = []
 
     for i in range(1, GRID_LEVELS + 1):
-
         if side == "buy":
             entry = price - spacing * i
-            tp = entry + spacing * 1.5
-            sl = entry - atr * 2
-
-            orders.append((entry, tp, sl, "buy"))
-
         else:
             entry = price + spacing * i
-            tp = entry - spacing * 1.5
-            sl = entry + atr * 2
 
-            orders.append((entry, tp, sl, "sell"))
+        grid.append(entry)
 
-    return orders, size
+    return grid
 
 # =========================
-# 🚀 EJECUTAR ÓRDENES
+# 🚀 PONER GRID
 # =========================
-
-def place_orders(symbol, orders, size, leverage):
+def place_grid(symbol, grid, size):
     try:
-        exchange.set_leverage(leverage, symbol)
+        for entry in grid:
+            side = "buy" if entry < grid[0] else "sell"
 
-        for entry, tp, sl, side in orders:
-
-            print(f"📌 {symbol} | {side.upper()} | Entry: {entry:.2f} | Size: {size}")
+            print(f"📌 GRID {symbol} | {side.upper()} | {entry:.2f}")
 
             exchange.create_order(
                 symbol=symbol,
@@ -134,24 +132,59 @@ def place_orders(symbol, orders, size, leverage):
                 side=side,
                 amount=size,
                 price=entry,
-                params={
-                    "tdMode": "cross",
-                    "tpTriggerPx": str(tp),
-                    "tpOrdPx": str(tp),
-                    "slTriggerPx": str(sl),
-                    "slOrdPx": str(sl)
-                }
+                params={"tdMode": "cross"}
             )
+    except Exception as e:
+        print(f"❌ Grid error: {e}")
+
+# =========================
+# 🎯 TP / SL SOLO SI HAY POSICIÓN
+# =========================
+def manage_position(symbol, position, atr):
+    try:
+        entry = float(position['entryPrice'])
+        size = float(position['contracts'])
+        side = position['side']
+
+        if side == "long":
+            tp = entry + atr * 1.5
+            sl = entry - atr * 2
+            exit_side = "sell"
+        else:
+            tp = entry - atr * 1.5
+            sl = entry + atr * 2
+            exit_side = "buy"
+
+        print(f"🎯 TP/SL {symbol} | TP: {tp:.2f} | SL: {sl:.2f}")
+
+        # TP
+        exchange.create_order(
+            symbol=symbol,
+            type="trigger",
+            side=exit_side,
+            amount=size,
+            price=tp,
+            params={"triggerPx": tp, "tdMode": "cross"}
+        )
+
+        # SL
+        exchange.create_order(
+            symbol=symbol,
+            type="trigger",
+            side=exit_side,
+            amount=size,
+            price=sl,
+            params={"triggerPx": sl, "tdMode": "cross"}
+        )
 
     except Exception as e:
-        print(f"❌ Error orden: {e}")
+        print(f"❌ TP/SL error: {e}")
 
 # =========================
 # 🔁 BOT LOOP
 # =========================
-
 def run():
-    print("🚀 BOT GRID FUTUROS OKX INICIADO")
+    print("🚀 BOT GRID PROFESIONAL OKX")
 
     while True:
         try:
@@ -159,9 +192,8 @@ def run():
             print(f"\n💰 Balance: {balance:.2f} USDT")
 
             for symbol in SYMBOLS:
-                df = get_data(symbol)
-                df = indicators(df)
 
+                df = get_data(symbol)
                 price = df['close'].iloc[-1]
                 atr = df['atr'].iloc[-1]
                 side = trend(df)
@@ -172,14 +204,21 @@ def run():
                 print(f"Tendencia: {side}")
                 print(f"Leverage: x{leverage}")
 
-                # 🧹 limpiar grid viejo
-                cancel_orders(symbol)
+                set_leverage(symbol, leverage)
 
-                # 📈 crear nuevo grid
-                grid, size = create_grid(symbol, price, atr, side, balance, leverage)
+                size = calculate_size(symbol, balance, price, leverage)
 
-                # 🚀 ejecutar
-                place_orders(symbol, grid, size, leverage)
+                # 🔍 VER SI YA HAY POSICIÓN
+                position = get_positions(symbol)
+
+                if position:
+                    print("✅ Posición activa detectada")
+                    manage_position(symbol, position, atr)
+                else:
+                    print("📈 Creando GRID nuevo")
+                    cancel_orders(symbol)
+                    grid = create_grid(price, atr, side)
+                    place_grid(symbol, grid, size)
 
             time.sleep(60)
 
@@ -190,6 +229,5 @@ def run():
 # =========================
 # ▶️ START
 # =========================
-
 if __name__ == "__main__":
     run()
