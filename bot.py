@@ -14,16 +14,36 @@ PASSPHRASE = "WXcv8089@"
 BASE_URL = "https://www.okx.com"
 
 CAPITAL = 50
-RIESGO = 0.05   # subimos un poco para que sí ejecute
+RIESGO = 0.05
 TIMEFRAME = "5m"
 
 MARGIN_MODE = "isolated"
 ATR_PERIOD = 14
 
-# =========================
+# ========= LOG =========
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+# ========= TIME FIX (CRÍTICO) =========
+
+last_ts = None
+last_time = 0
+
+def get_server_time_cached():
+    global last_ts, last_time
+    now = time.time()
+
+    if now - last_time > 2:
+        try:
+            url = "https://www.okx.com/api/v5/public/time"
+            r = requests.get(url, timeout=5).json()
+            last_ts = r["data"][0]["ts"]
+            last_time = now
+        except:
+            pass
+
+    return last_ts
 
 # ========= AUTH =========
 
@@ -34,7 +54,12 @@ def sign(ts, method, path, body=""):
     ).decode()
 
 def headers(method, path, body=""):
-    ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    server_ts = get_server_time_cached()
+
+    ts = datetime.fromtimestamp(
+        int(server_ts)/1000, UTC
+    ).isoformat().replace("+00:00", "Z")
+
     return {
         "OK-ACCESS-KEY": API_KEY,
         "OK-ACCESS-SIGN": sign(ts, method, path, body),
@@ -47,10 +72,12 @@ def headers(method, path, body=""):
 
 def get_klines(symbol):
     url = f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100"
-    data = requests.get(url).json()["data"]
+    data = requests.get(url, timeout=10).json()["data"]
+
     df = pd.DataFrame(data)
     df = df.iloc[:, :6]
     df.columns = ["time","open","high","low","close","volume"]
+
     return df.astype(float)[::-1]
 
 # ========= INDICADORES =========
@@ -80,10 +107,10 @@ def format_price(price):
 def place(symbol, side, price, size):
     try:
         if price <= 0:
+            log("⚠️ Precio inválido")
             return
 
         px = format_price(price)
-
         posSide = "long" if side == "buy" else "short"
 
         body = json.dumps({
@@ -99,15 +126,19 @@ def place(symbol, side, price, size):
         r = requests.post(
             BASE_URL + "/api/v5/trade/order",
             headers=headers("POST","/api/v5/trade/order",body),
-            data=body
+            data=body,
+            timeout=10
         ).json()
 
-        log(f"{symbol} {side.upper()} @ {px} | resp: {r}")
+        if r.get("code") != "0":
+            log(f"❌ Orden rechazada: {r}")
+        else:
+            log(f"✅ {symbol} {side.upper()} @ {px}")
 
     except Exception as e:
-        log(f"Error orden: {e}")
+        log(f"❌ Error orden: {e}")
 
-# ========= BOT SIMPLE TEST =========
+# ========= BOT =========
 
 def run():
     symbol = "BTC-USDT-SWAP"
@@ -120,6 +151,7 @@ def run():
             atr_val = atr(df).iloc[-1]
 
             if np.isnan(atr_val):
+                log("⚠️ ATR inválido")
                 time.sleep(30)
                 continue
 
@@ -131,7 +163,7 @@ def run():
 
             size = max(0.001, round((CAPITAL * RIESGO) / price, 3))
 
-            log("🚀 colocando grid real")
+            log("🚀 Ejecutando GRID REAL")
 
             for n in grid:
                 if n < price:
@@ -142,8 +174,10 @@ def run():
             time.sleep(120)
 
         except Exception as e:
-            log(f"ERROR: {e}")
+            log(f"❌ ERROR GENERAL: {e}")
             time.sleep(30)
+
+# ========= START =========
 
 if __name__ == "__main__":
     run()
