@@ -35,22 +35,17 @@ def headers(method, path, body=""):
 
 # ========= BALANCE =========
 def get_balance():
-    r = requests.get(
-        BASE_URL + "/api/v5/account/balance",
-        headers=headers("GET","/api/v5/account/balance")
-    ).json()
+    try:
+        r = requests.get(
+            BASE_URL + "/api/v5/account/balance",
+            headers=headers("GET","/api/v5/account/balance")
+        ).json()
 
-    for d in r["data"][0]["details"]:
-        if d["ccy"] == "USDT":
-            return float(d["availEq"])
-
-# ========= PRECIO =========
-def get_price():
-    r = requests.get(
-        f"{BASE_URL}/api/v5/market/ticker?instId={SYMBOL}"
-    ).json()
-
-    return float(r["data"][0]["last"])
+        for d in r["data"][0]["details"]:
+            if d["ccy"] == "USDT":
+                return float(d["availEq"])
+    except:
+        return None
 
 # ========= LEVERAGE =========
 def set_leverage():
@@ -69,14 +64,8 @@ def set_leverage():
     log(f"⚙️ Leverage: {r}")
 
 # ========= SIZE (CONTRATOS) =========
-def get_contracts(balance, price):
-
-    usd_risk = balance * RIESGO
-
-    # ⚠️ contrato BTC ≈ 100 USD (aprox)
-    contract_value = 100  
-
-    contracts = int(usd_risk / contract_value)
+def get_contracts(balance):
+    contracts = int(balance * RIESGO)
 
     if contracts < 1:
         contracts = 1
@@ -86,8 +75,7 @@ def get_contracts(balance, price):
 # ========= ORDEN =========
 def place_order(side, balance):
 
-    price = get_price()
-    contracts = get_contracts(balance, price)
+    contracts = get_contracts(balance)
 
     log(f"📦 contratos: {contracts}")
 
@@ -95,9 +83,8 @@ def place_order(side, balance):
         "instId": SYMBOL,
         "tdMode": "isolated",
         "side": side,
-        "posSide": "long" if side == "buy" else "short",
         "ordType": "market",
-        "sz": contracts   # 🔥 ENTERO
+        "sz": contracts
     })
 
     r = requests.post(
@@ -110,14 +97,20 @@ def place_order(side, balance):
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT OKX FINAL (CONTRATOS)")
+    log("🚀 BOT OKX FINAL (OPERATIVO REAL)")
 
     set_leverage()
 
     while True:
         try:
             balance = get_balance()
-            log(f"💰 Balance: {balance}")
+
+            if not balance:
+                log("❌ error balance")
+                time.sleep(10)
+                continue
+
+            log(f"💰 Balance: {balance} USDT")
 
             if balance < 5:
                 log("⚠️ saldo bajo")
@@ -126,6 +119,7 @@ def run():
 
             log("🚨 ENVIANDO ORDEN")
 
+            # 🔥 puedes cambiar a "sell"
             place_order("buy", balance)
 
             time.sleep(60)
