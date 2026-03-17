@@ -1,7 +1,6 @@
 import ccxt
 import time
 import pandas as pd
-import numpy as np
 
 # =========================
 # 🔐 CONFIG
@@ -12,8 +11,12 @@ PASSPHRASE = "WXcv8089@"
 
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
-TARGET_PROFIT = 1.0  # 🔥 1 USDT
 RISK = 0.05
+MAX_DRAWDOWN = 0.05  # 5% pérdida máxima diaria
+COOLDOWN = 60  # segundos entre trades
+
+start_balance = None
+last_trade_time = 0
 
 # =========================
 # 🔌 OKX
@@ -33,53 +36,34 @@ exchange = ccxt.okx({
 # 📊 DATA
 # =========================
 def get_data(symbol):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=200)
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=150)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
 
     df['ema20'] = df['close'].ewm(span=20).mean()
     df['ema50'] = df['close'].ewm(span=50).mean()
     df['atr'] = (df['high'] - df['low']).rolling(14).mean()
-
-    df['momentum'] = df['close'].pct_change(3)
-    df['vol_mean'] = df['volume'].rolling(20).mean()
+    df['adx'] = abs(df['ema20'] - df['ema50'])
 
     return df
 
 # =========================
-# 🧠 IA PREDICTIVA
+# 🧠 FILTRO MERCADO
 # =========================
-def ai_signal(df):
+def market_ok(df):
     last = df.iloc[-1]
 
-    # volumen anormal (acumulación)
-    vol_spike = last['volume'] > last['vol_mean'] * 1.8
-
-    # movimiento anticipado
-    momentum = last['momentum']
-
-    # tendencia base
-    trend = "buy" if last['ema20'] > last['ema50'] else "sell"
-
-    if vol_spike and abs(momentum) > 0.001:
-        return trend
-
-    return None
-
-# =========================
-# 🐋 DETECTOR BALLENAS
-# =========================
-def whale_filter(df):
-    last = df.iloc[-1]
-
-    candle_range = last['high'] - last['low']
-    atr = last['atr']
-
-    # si vela muy grande → manipulación
-    if candle_range > atr * 2.5:
-        print("🐋 Ballena detectada - evitar entrada")
+    # evitar lateral
+    if last['adx'] < last['atr'] * 0.3:
         return False
 
     return True
+
+# =========================
+# 🧠 SEÑAL
+# =========================
+def get_signal(df):
+    last = df.iloc[-1]
+    return "buy" if last['ema20'] > last['ema50'] else "sell"
 
 # =========================
 # ⚙️ LEVERAGE
@@ -109,13 +93,6 @@ def cleanup(symbol):
         orders = exchange.fetch_open_orders(symbol)
         for o in orders:
             exchange.cancel_order(o['id'], symbol)
-
-        try:
-            exchange.private_post_trade_cancel_algos({
-                "instId": exchange.market(symbol)['id']
-            })
-        except:
-            pass
     except:
         pass
 
@@ -158,9 +135,9 @@ def enter(symbol, side, size):
     print(f"🚀 ENTRY {side} {symbol}")
 
 # =========================
-# 💰 MICRO PROFIT 1 USDT
+# 🎯 GESTIÓN PROFESIONAL
 # =========================
-def manage(symbol, pos):
+def manage(symbol, pos, atr):
     entry = float(pos['entryPrice'])
     size = float(pos['contracts'])
     side = pos['side']
@@ -168,12 +145,23 @@ def manage(symbol, pos):
 
     pnl = (mark - entry) * size if side == "long" else (entry - mark) * size
 
-    print(f"💰 PnL actual: {pnl:.2f} USDT")
+    # 🔥 PROFIT DINÁMICO
+    target = atr * size * 1.2
 
-    # 🔥 CIERRE EN 1 USDT
-    if pnl >= TARGET_PROFIT:
-        exit_side = "sell" if side == "long" else "buy"
+    # 🔥 TRAILING
+    if pnl > target * 0.5:
+        sl = entry  # break-even
+    else:
+        sl = entry - atr if side == "long" else entry + atr
 
+    # 🔥 TP dinámico
+    tp = entry + atr * 1.5 if side == "long" else entry - atr * 1.5
+
+    exit_side = "sell" if side == "long" else "buy"
+
+    print(f"💰 PnL: {pnl:.2f} | Target: {target:.2f}")
+
+    if pnl >= target:
         exchange.create_order(
             symbol=symbol,
             type="market",
@@ -181,8 +169,24 @@ def manage(symbol, pos):
             amount=size,
             params={"tdMode": "isolated"}
         )
+        print("💵 PROFIT CERRADO")
 
-        print("💵 GANANCIA ASEGURADA +1 USDT")
+# =========================
+# 🛑 CONTROL RIESGO
+# =========================
+def risk_control(balance):
+    global start_balance
+
+    if start_balance is None:
+        start_balance = balance
+
+    drawdown = (start_balance - balance) / start_balance
+
+    if drawdown >= MAX_DRAWDOWN:
+        print("🛑 STOP GLOBAL ACTIVADO")
+        return False
+
+    return True
 
 # =========================
 # 🧠 MEJOR PAR
@@ -193,7 +197,7 @@ def choose_symbol():
 
     for s in SYMBOLS:
         df = get_data(s)
-        score = abs(df['momentum'].iloc[-1]) + (df['atr'].iloc[-1] / df['close'].iloc[-1])
+        score = df['atr'].iloc[-1] / df['close'].iloc[-1]
 
         if score > best_score:
             best_score = score
@@ -205,39 +209,45 @@ def choose_symbol():
 # 🔁 LOOP
 # =========================
 def run():
-    print("🧠 IA + 🐋 BOT ACTIVADO")
+    global last_trade_time
+
+    print("🔥 BOT RENTABLE ACTIVADO")
 
     while True:
         try:
             balance = exchange.fetch_balance()['USDT']['free']
 
+            if not risk_control(balance):
+                break
+
             symbol = choose_symbol()
             df = get_data(symbol)
 
-            if not whale_filter(df):
+            if not market_ok(df):
+                print("⏸ Mercado lateral")
                 time.sleep(20)
                 continue
 
-            signal = ai_signal(df)
-
-            if signal is None:
-                print("⏸ Sin señal IA")
-                time.sleep(20)
-                continue
+            signal = get_signal(df)
 
             price = df['close'].iloc[-1]
             atr = df['atr'].iloc[-1]
-
             lev = dynamic_leverage(atr, price)
 
             pos = get_position(symbol)
+
+            # evitar sobreoperar
+            if time.time() - last_trade_time < COOLDOWN:
+                time.sleep(10)
+                continue
 
             if not pos:
                 set_leverage(symbol, lev)
                 size = size_calc(symbol, balance, price, lev)
                 enter(symbol, signal, size)
+                last_trade_time = time.time()
             else:
-                manage(symbol, pos)
+                manage(symbol, pos, atr)
 
             time.sleep(20)
 
