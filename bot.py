@@ -10,13 +10,19 @@ API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
 SECRET = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
 PASSPHRASE = os.getenv("WXcv8089@")
 
-# ✅ VALIDACIÓN API (CRÍTICO)
-if not API_KEY or not SECRET or not PASSPHRASE:
-    raise ValueError("❌ ERROR: API KEYS NO CONFIGURADAS EN RAILWAY")
-
 BASE_URL = "https://www.okx.com"
 AI_FILE = "ai_trades.json"
 MAX_TRADES = 3
+
+# =========================
+# 🟢 MODO AUTOMÁTICO
+# =========================
+if not API_KEY or not SECRET or not PASSPHRASE:
+    print("⚠️ API no configurada → MODO SIMULACIÓN")
+    REAL_TRADING = False
+else:
+    print("✅ API detectada → MODO REAL")
+    REAL_TRADING = True
 
 # =========================
 # 🕒 UTC
@@ -44,7 +50,7 @@ def safe_request(method, url, headers=None, json_data=None, retries=3):
     return {}
 
 # =========================
-# 🧠 IA
+# 🧠 IA SIMPLE
 # =========================
 def load_ai():
     try:
@@ -57,16 +63,15 @@ def load_ai():
                 return {"trades":[]}
             return json.loads(content)
 
-    except Exception as e:
-        print("Error IA:", e)
+    except:
         return {"trades":[]}
 
 def save_ai(data):
     try:
         with open(AI_FILE, "w") as f:
             json.dump(data, f, indent=2)
-    except Exception as e:
-        print("Error guardando IA:", e)
+    except:
+        pass
 
 def winrate():
     data = load_ai()
@@ -82,48 +87,22 @@ def winrate():
 # 🔐 AUTH
 # =========================
 def sign(msg):
-    try:
-        if not SECRET:
-            raise ValueError("SECRET vacío")
-
-        return base64.b64encode(
-            hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).digest()
-        ).decode()
-
-    except Exception as e:
-        print("Error firma:", e)
+    if not SECRET:
         return ""
+    return base64.b64encode(
+        hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).digest()
+    ).decode()
 
 def headers(method, path, body=""):
     ts = utc_now()
     msg = ts + method + path + body
     return {
-        "OK-ACCESS-KEY": API_KEY,
+        "OK-ACCESS-KEY": API_KEY or "",
         "OK-ACCESS-SIGN": sign(msg),
         "OK-ACCESS-TIMESTAMP": ts,
-        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+        "OK-ACCESS-PASSPHRASE": PASSPHRASE or "",
         "Content-Type": "application/json"
     }
-
-# =========================
-# 💰 BALANCE
-# =========================
-def get_balance():
-    try:
-        path = "/api/v5/account/balance"
-        r = safe_request("GET", BASE_URL + path, headers("GET", path))
-
-        if "data" not in r:
-            return 50
-
-        for d in r["data"][0]["details"]:
-            if d["ccy"] == "USDT":
-                return float(d["availBal"])
-
-    except Exception as e:
-        print("Error balance:", e)
-
-    return 50
 
 # =========================
 # 📊 DATOS
@@ -177,7 +156,6 @@ def modo(df):
 
 def condicion(df):
     precio = df["c"].iloc[-1]
-
     if precio == 0:
         return "NORMAL"
 
@@ -212,10 +190,10 @@ def parametros(df, balance):
     if atr == 0:
         atr = p * 0.001
 
-    m = modo(df)
-
     if condicion(df) == "ALTA":
         return None
+
+    m = modo(df)
 
     riesgo = 0.01 * balance
     size = max(1, int(riesgo / atr))
@@ -238,11 +216,15 @@ def parametros(df, balance):
 # =========================
 # 🚀 TRADING
 # =========================
-def order(pair, side, size):
+def ejecutar_trade(pair, m, price, levels, step, size):
+    if not REAL_TRADING:
+        print(f"🧪 SIMULADO → {pair} {m} size:{size}")
+        return
+
     body = {
         "instId": pair,
         "tdMode": "cross",
-        "side": "buy" if side=="LONG" else "sell",
+        "side": "buy" if m=="LONG" else "sell",
         "ordType": "market",
         "sz": str(size)
     }
@@ -251,45 +233,21 @@ def order(pair, side, size):
                  headers("POST","/api/v5/trade/order",str(body)),
                  body)
 
-def grid(pair, price, levels, step, side, size):
     for i in range(1, levels + 1):
-        px = price - step*i if side=="LONG" else price + step*i
+        px = price - step*i if m=="LONG" else price + step*i
 
-        body = {
+        grid_body = {
             "instId": pair,
             "tdMode": "cross",
-            "side": "buy" if side=="LONG" else "sell",
+            "side": "buy" if m=="LONG" else "sell",
             "ordType": "limit",
             "px": str(round(px,4)),
             "sz": str(size)
         }
 
         safe_request("POST", BASE_URL + "/api/v5/trade/order",
-                     headers("POST","/api/v5/trade/order",str(body)),
-                     body)
-
-def tpsl(pair, tp, sl, side, size):
-    body = {
-        "instId": pair,
-        "tdMode": "cross",
-        "side": "sell" if side=="LONG" else "buy",
-        "ordType": "conditional",
-        "tpTriggerPx": str(tp),
-        "tpOrdPx": str(tp),
-        "slTriggerPx": str(sl),
-        "slOrdPx": str(sl),
-        "sz": str(size)
-    }
-
-    safe_request("POST", BASE_URL + "/api/v5/trade/order-algo",
-                 headers("POST","/api/v5/trade/order-algo",str(body)),
-                 body)
-
-def open_positions():
-    r = safe_request("GET", BASE_URL + "/api/v5/account/positions",
-                     headers("GET","/api/v5/account/positions"))
-
-    return len(r.get("data", []))
+                     headers("POST","/api/v5/trade/order",str(grid_body)),
+                     grid_body)
 
 # =========================
 # 🔁 LOOP
@@ -297,12 +255,7 @@ def open_positions():
 def run():
     while True:
         try:
-            balance = get_balance()
-
-            if open_positions() >= MAX_TRADES:
-                print("⚠️ Máximo trades activos")
-                time.sleep(120)
-                continue
+            balance = 50
 
             pairs = get_pairs()
 
@@ -320,14 +273,12 @@ def run():
 
                 print(f"🚀 {p} | {m} | size:{size}")
 
-                order(p,m,size)
-                grid(p,price,levels,step,m,size)
-                tpsl(p,tp,sl,m,size)
+                ejecutar_trade(p, m, price, levels, step, size)
 
             time.sleep(300)
 
         except Exception as e:
-            print("ERROR GENERAL:", e)
+            print("ERROR:", e)
             traceback.print_exc()
             time.sleep(60)
 
