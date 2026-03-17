@@ -35,10 +35,13 @@ def get_server_time_cached():
     now = time.time()
 
     if last_ts is None or now - last_time > 5:
-        url = "https://www.okx.com/api/v5/public/time"
-        r = requests.get(url, timeout=5).json()
-        last_ts = r["data"][0]["ts"]
-        last_time = now
+        try:
+            url = "https://www.okx.com/api/v5/public/time"
+            r = requests.get(url, timeout=5).json()
+            last_ts = r["data"][0]["ts"]
+            last_time = now
+        except Exception as e:
+            log(f"⚠️ Error tiempo: {e}")
 
     return last_ts
 
@@ -53,9 +56,11 @@ def sign(ts, method, path, body=""):
 def headers(method, path, body=""):
     server_ts = get_server_time_cached()
 
+    if server_ts is None:
+        raise Exception("No hay timestamp")
+
     ts_sec = int(server_ts) / 1000
     dt = datetime.fromtimestamp(ts_sec, UTC)
-
     ts = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
     return {
@@ -123,13 +128,11 @@ def place(symbol, side, price, size):
             return
 
         px = format_price(price)
-        posSide = "long" if side == "buy" else "short"
 
         body = json.dumps({
             "instId": symbol,
             "tdMode": MARGIN_MODE,
             "side": side,
-            "posSide": posSide,
             "ordType": "limit",
             "px": str(px),
             "sz": str(size)
@@ -174,12 +177,11 @@ def run():
             grid = [price + (i - niveles//2)*paso for i in range(niveles)]
 
             lot_size = get_lot_size(symbol)
-
             raw_size = (CAPITAL * RIESGO) / price
             size = adjust_size(raw_size, lot_size)
 
-            log(f"📦 Size ajustado: {size} | Lot: {lot_size}")
-            log("🚀 Ejecutando GRID REAL")
+            log(f"📦 Size: {size} | Lot: {lot_size}")
+            log("🚀 GRID ACTIVO")
 
             for n in grid:
                 if n < price:
