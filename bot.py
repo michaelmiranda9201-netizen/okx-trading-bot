@@ -1,6 +1,7 @@
 import ccxt
 import time
 import pandas as pd
+import numpy as np
 
 # =========================
 # 🔐 CONFIG
@@ -12,8 +13,7 @@ PASSPHRASE = "WXcv8089@"
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
 TIMEFRAME = '1m'
-RISK_PER_TRADE = 0.05
-GRID_LEVELS = 3
+RISK = 0.05
 
 # =========================
 # 🔌 OKX
@@ -25,26 +25,63 @@ exchange = ccxt.okx({
     'enableRateLimit': True,
     'options': {
         'defaultType': 'swap',
-        'defaultMarginMode': 'isolated'  # 🔥 FORZAR AISLADO
+        'defaultMarginMode': 'isolated'
     }
 })
 
 # =========================
-# 📊 DATA
+# 📊 DATA + FILTROS PRO
 # =========================
 def get_data(symbol):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=150)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
+
     df['ema20'] = df['close'].ewm(span=20).mean()
     df['ema50'] = df['close'].ewm(span=50).mean()
     df['atr'] = (df['high'] - df['low']).rolling(14).mean()
+
+    # 🔥 FUERZA DE TENDENCIA
+    df['momentum'] = df['close'].pct_change(5)
+
     return df
 
-def trend(df):
-    return "buy" if df['ema20'].iloc[-1] > df['ema50'].iloc[-1] else "sell"
+# =========================
+# 🧠 FILTRO INTELIGENTE
+# =========================
+def smart_signal(df):
+    last = df.iloc[-1]
+
+    trend = "buy" if last['ema20'] > last['ema50'] else "sell"
+
+    # 🔥 FILTRO ANTI-LATERAL
+    if abs(last['momentum']) < 0.001:
+        return None
+
+    return trend
 
 # =========================
-# ⚙️ LEVERAGE DINÁMICO REAL
+# 🧠 MEJOR PAR
+# =========================
+def choose_symbol():
+    best = None
+    best_score = 0
+
+    for s in SYMBOLS:
+        df = get_data(s)
+        atr = df['atr'].iloc[-1]
+        price = df['close'].iloc[-1]
+        momentum = abs(df['momentum'].iloc[-1])
+
+        score = (atr / price) + momentum
+
+        if score > best_score:
+            best_score = score
+            best = s
+
+    return best
+
+# =========================
+# ⚙️ LEVERAGE DINÁMICO
 # =========================
 def dynamic_leverage(atr, price):
     vol = atr / price
@@ -53,40 +90,46 @@ def dynamic_leverage(atr, price):
         return 10
     elif vol < 0.005:
         return 7
-    elif vol < 0.01:
-        return 5
     else:
-        return 3
+        return 5
 
-def set_leverage(symbol, leverage):
+# =========================
+# 🧹 LIMPIEZA TOTAL
+# =========================
+def cleanup(symbol):
     try:
-        market = exchange.market(symbol)
+        orders = exchange.fetch_open_orders(symbol)
+        for o in orders:
+            exchange.cancel_order(o['id'], symbol)
 
-        exchange.set_leverage(
-            leverage,
-            market['id'],
-            params={"mgnMode": "isolated"}
-        )
+        try:
+            exchange.private_post_trade_cancel_algos({
+                "instId": exchange.market(symbol)['id']
+            })
+        except:
+            pass
 
-        print(f"⚙️ {symbol} → Leverage x{leverage} AISLADO")
-
-    except Exception as e:
-        print(f"❌ Error leverage: {e}")
-
-# =========================
-# 💰 BALANCE
-# =========================
-def get_balance():
-    return exchange.fetch_balance()['USDT']['free']
+    except:
+        pass
 
 # =========================
-# 📏 SIZE OKX CORRECTO
+# ⚙️ LEVERAGE
 # =========================
-def calculate_size(symbol, balance, price, leverage):
-    risk = balance * RISK_PER_TRADE
-    position_value = risk * leverage
+def set_leverage(symbol, lev):
+    cleanup(symbol)
 
-    size = position_value / price
+    exchange.set_leverage(
+        lev,
+        exchange.market(symbol)['id'],
+        params={"mgnMode": "isolated"}
+    )
+
+# =========================
+# 💰 SIZE
+# =========================
+def size_calc(symbol, balance, price, lev):
+    value = balance * RISK * lev
+    size = value / price
 
     if size < 0.01:
         size = 0.01
@@ -94,12 +137,12 @@ def calculate_size(symbol, balance, price, leverage):
     return float(exchange.amount_to_precision(symbol, size))
 
 # =========================
-# 📊 POSICIONES
+# 📊 POSICIÓN
 # =========================
 def get_position(symbol):
     try:
-        positions = exchange.fetch_positions([symbol])
-        for p in positions:
+        pos = exchange.fetch_positions([symbol])
+        for p in pos:
             if float(p['contracts']) > 0:
                 return p
     except:
@@ -107,145 +150,99 @@ def get_position(symbol):
     return None
 
 # =========================
-# 🧹 CANCELAR ÓRDENES
+# 🚀 ENTRADA
 # =========================
-def cancel_orders(symbol):
-    try:
-        orders = exchange.fetch_open_orders(symbol)
-        for o in orders:
-            exchange.cancel_order(o['id'], symbol)
-    except:
-        pass
-
-# =========================
-# 📈 GRID INTELIGENTE
-# =========================
-def create_grid(price, atr, side):
-    spacing = atr * 0.5
-    levels = []
-
-    for i in range(1, GRID_LEVELS + 1):
-        if side == "buy":
-            levels.append(price - spacing * i)
-        else:
-            levels.append(price + spacing * i)
-
-    return levels
-
-def place_grid(symbol, levels, size):
-    try:
-        for price in levels:
-            side = "buy" if price < levels[0] else "sell"
-
-            print(f"📌 GRID {symbol} | {side.upper()} | {price:.2f}")
-
-            exchange.create_order(
-                symbol=symbol,
-                type="limit",
-                side=side,
-                amount=size,
-                price=price,
-                params={"tdMode": "isolated"}  # 🔥 AISLADO
-            )
-    except Exception as e:
-        print(f"❌ Grid error: {e}")
+def enter(symbol, side, size):
+    exchange.create_order(
+        symbol=symbol,
+        type="market",
+        side=side,
+        amount=size,
+        params={"tdMode": "isolated"}
+    )
+    print(f"🚀 ENTRY {side} {symbol}")
 
 # =========================
-# 🎯 TP / SL PROFESIONAL
+# 🎯 GESTIÓN ULTRA
 # =========================
-def manage_position(symbol, position, atr):
-    try:
-        entry = float(position['entryPrice'])
-        size = float(position['contracts'])
-        side = position['side']
+def manage(symbol, pos, atr):
+    entry = float(pos['entryPrice'])
+    size = float(pos['contracts'])
+    side = pos['side']
+    mark = float(pos['markPrice'])
 
-        if side == "long":
-            tp = entry + atr * 1.5
-            sl = entry - atr * 2
-            exit_side = "sell"
-        else:
-            tp = entry - atr * 1.5
-            sl = entry + atr * 2
-            exit_side = "buy"
+    profit = (mark - entry) if side == "long" else (entry - mark)
 
-        print(f"🎯 {symbol} TP: {tp:.2f} | SL: {sl:.2f}")
+    # 🔥 BREAK EVEN
+    if profit > atr * 0.3:
+        sl = entry
+    else:
+        sl = entry - atr if side == "long" else entry + atr
 
-        # TAKE PROFIT
-        exchange.create_order(
-            symbol=symbol,
-            type="trigger",
-            side=exit_side,
-            amount=size,
-            price=tp,
-            params={
-                "triggerPx": tp,
-                "tdMode": "isolated"
-            }
-        )
+    # 🔥 TRAILING PROFIT
+    tp = entry + atr if side == "long" else entry - atr
 
-        # STOP LOSS
-        exchange.create_order(
-            symbol=symbol,
-            type="trigger",
-            side=exit_side,
-            amount=size,
-            price=sl,
-            params={
-                "triggerPx": sl,
-                "tdMode": "isolated"
-            }
-        )
+    exit_side = "sell" if side == "long" else "buy"
 
-    except Exception as e:
-        print(f"❌ TP/SL error: {e}")
+    print(f"📊 Gestión | Profit: {profit:.2f}")
+
+    exchange.create_order(
+        symbol=symbol,
+        type="trigger",
+        side=exit_side,
+        amount=size,
+        price=tp,
+        params={"triggerPx": tp, "tdMode": "isolated"}
+    )
+
+    exchange.create_order(
+        symbol=symbol,
+        type="trigger",
+        side=exit_side,
+        amount=size,
+        price=sl,
+        params={"triggerPx": sl, "tdMode": "isolated"}
+    )
 
 # =========================
-# 🔁 BOT LOOP
+# 🔁 LOOP
 # =========================
 def run():
-    print("🚀 BOT GRID PRO | OKX FUTUROS AISLADO")
+    print("💣 ULTRA DIOS RUNNING")
 
     while True:
         try:
-            balance = get_balance()
-            print(f"\n💰 Balance: {balance:.2f} USDT")
+            balance = exchange.fetch_balance()['USDT']['free']
 
-            for symbol in SYMBOLS:
+            symbol = choose_symbol()
+            df = get_data(symbol)
 
-                df = get_data(symbol)
-                price = df['close'].iloc[-1]
-                atr = df['atr'].iloc[-1]
-                side = trend(df)
-                leverage = dynamic_leverage(atr, price)
+            signal = smart_signal(df)
 
-                print(f"\n📊 {symbol}")
-                print(f"Precio: {price}")
-                print(f"Tendencia: {side}")
-                print(f"Leverage dinámico: x{leverage}")
+            if signal is None:
+                print("⏸ Mercado lateral - no trade")
+                time.sleep(20)
+                continue
 
-                set_leverage(symbol, leverage)
+            price = df['close'].iloc[-1]
+            atr = df['atr'].iloc[-1]
 
-                size = calculate_size(symbol, balance, price, leverage)
+            lev = dynamic_leverage(atr, price)
 
-                position = get_position(symbol)
+            pos = get_position(symbol)
 
-                if position:
-                    print("✅ Posición activa")
-                    manage_position(symbol, position, atr)
-                else:
-                    print("📈 Nuevo GRID")
-                    cancel_orders(symbol)
-                    grid = create_grid(price, atr, side)
-                    place_grid(symbol, grid, size)
+            if not pos:
+                set_leverage(symbol, lev)
+                size = size_calc(symbol, balance, price, lev)
+                enter(symbol, signal, size)
+            else:
+                manage(symbol, pos, atr)
 
-            time.sleep(60)
+            time.sleep(25)
 
         except Exception as e:
-            print(f"❌ ERROR GENERAL: {e}")
-            time.sleep(30)
+            print(f"❌ ERROR: {e}")
+            time.sleep(15)
 
-# =========================
-# ▶️ START
-# =========================
 if __name__ == "__main__":
     run()
