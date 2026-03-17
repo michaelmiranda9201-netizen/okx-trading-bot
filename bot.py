@@ -10,11 +10,15 @@ API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
 SECRET_KEY = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
 PASSPHRASE = os.getenv("WXcv8089@")
 
+# 🔥 VALIDACIÓN CRÍTICA
+if not API_KEY or not SECRET_KEY or not PASSPHRASE:
+    raise Exception("❌ ERROR: Faltan credenciales API en Railway")
+
 BASE_URL = "https://www.okx.com"
 
 SYMBOLS = ["BTC-USDT-SWAP","ETH-USDT-SWAP","SOL-USDT-SWAP"]
 
-RIESGO = 0.03   # ajustado para cuentas pequeñas
+RIESGO = 0.03
 TIMEFRAME = "1m"
 
 price_data = {}
@@ -86,7 +90,7 @@ def get_klines(symbol):
     except:
         return None
 
-# ========= IA (ACTIVA) =========
+# ========= IA =========
 def ai_signal(df):
     try:
         close = df["close"]
@@ -125,7 +129,7 @@ def headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-# ========= BALANCE REAL =========
+# ========= BALANCE =========
 def get_balance():
     try:
         r = requests.get(
@@ -155,8 +159,7 @@ def get_size(balance, price):
         return 0
 
     size = (balance * RIESGO) / price
-
-    return max(round(size, 3), 0.001)  # mínimo válido
+    return max(round(size, 3), 0.001)
 
 # ========= TRADE =========
 def place(symbol, side, price, balance):
@@ -190,7 +193,7 @@ def place(symbol, side, price, balance):
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT REAL CUENTA PEQUEÑA")
+    log("🚀 BOT SEGURO INICIADO")
 
     start_ws()
 
@@ -199,7 +202,7 @@ def run():
             balance = get_balance()
 
             if balance is None:
-                log("❌ no balance")
+                log("❌ No se pudo obtener balance")
                 time.sleep(10)
                 continue
 
