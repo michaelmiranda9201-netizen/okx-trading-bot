@@ -14,7 +14,7 @@ BASE_URL = "https://www.okx.com"
 
 SYMBOLS = ["BTC-USDT-SWAP","ETH-USDT-SWAP","SOL-USDT-SWAP"]
 
-RIESGO = 0.02   # subido para que opere
+RIESGO = 0.03   # ajustado para cuentas pequeñas
 TIMEFRAME = "1m"
 
 price_data = {}
@@ -70,31 +70,36 @@ def get_klines(symbol):
             f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100",
             timeout=5
         )
-        df = pd.DataFrame(r.json()["data"])
+        data = r.json()
+
+        if "data" not in data:
+            return None
+
+        df = pd.DataFrame(data["data"])
+        if df.empty:
+            return None
+
         df = df.iloc[:, :6]
         df.columns = ["time","open","high","low","close","volume"]
         return df.astype(float)[::-1]
+
     except:
         return None
 
-# ========= IA (MENOS ESTRICTA) =========
+# ========= IA (ACTIVA) =========
 def ai_signal(df):
     try:
-        if df is None or df.empty:
-            return None
-
         close = df["close"]
 
+        ema20 = close.ewm(span=20).mean().iloc[-1]
         ema50 = close.ewm(span=50).mean().iloc[-1]
-        ema200 = close.ewm(span=200).mean().iloc[-1]
 
-        momentum = close.pct_change().iloc[-3:].mean()
+        momentum = close.pct_change().iloc[-2:].mean()
 
-        # 🔥 MÁS FLEXIBLE
-        if ema50 > ema200 and momentum > 0:
+        if ema20 > ema50 and momentum > 0:
             return "buy"
 
-        if ema50 < ema200 and momentum < 0:
+        if ema20 < ema50 and momentum < 0:
             return "sell"
 
         return None
@@ -120,19 +125,29 @@ def headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-# ========= BALANCE =========
+# ========= BALANCE REAL =========
 def get_balance():
     try:
         r = requests.get(
-            BASE_URL+"/api/v5/account/balance",
-            headers=headers("GET","/api/v5/account/balance"),
+            BASE_URL + "/api/v5/account/balance",
+            headers=headers("GET", "/api/v5/account/balance"),
             timeout=5
         )
-        for d in r.json()["data"][0]["details"]:
+
+        data = r.json()
+        log(f"📊 Balance raw: {data}")
+
+        if "data" not in data:
+            return None
+
+        for d in data["data"][0]["details"]:
             if d["ccy"] == "USDT":
-                return float(d["eq"])
-    except:
-        return 50
+                return float(d["availEq"])
+
+    except Exception as e:
+        log(f"❌ Error balance: {e}")
+
+    return None
 
 # ========= SIZE =========
 def get_size(balance, price):
@@ -141,8 +156,7 @@ def get_size(balance, price):
 
     size = (balance * RIESGO) / price
 
-    # 🔥 tamaño mínimo para OKX
-    return max(round(size, 3), 0.001)
+    return max(round(size, 3), 0.001)  # mínimo válido
 
 # ========= TRADE =========
 def place(symbol, side, price, balance):
@@ -176,14 +190,25 @@ def place(symbol, side, price, balance):
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT OPERATIVO (FIXED)")
+    log("🚀 BOT REAL CUENTA PEQUEÑA")
 
     start_ws()
 
     while True:
         try:
             balance = get_balance()
-            log(f"💰 Balance: {balance}")
+
+            if balance is None:
+                log("❌ no balance")
+                time.sleep(10)
+                continue
+
+            log(f"💰 Balance REAL: {balance}")
+
+            if balance < 2:
+                log("⚠️ saldo demasiado bajo")
+                time.sleep(60)
+                continue
 
             for symbol in SYMBOLS:
 
@@ -192,7 +217,6 @@ def run():
                     continue
 
                 signal = ai_signal(df)
-
                 if not signal:
                     continue
 
