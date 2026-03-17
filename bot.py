@@ -73,12 +73,27 @@ def get_balance():
 
     return None
 
-# ========= LOT SIZE FIX =========
+# ========= LEVERAGE =========
+def set_leverage(symbol):
+    body = json.dumps({
+        "instId": symbol,
+        "lever": "5",
+        "mgnMode": "isolated"
+    })
+
+    r = requests.post(
+        BASE_URL + "/api/v5/account/set-leverage",
+        headers=headers("POST", "/api/v5/account/set-leverage", body),
+        data=body
+    ).json()
+
+    log(f"⚙️ Leverage set: {r}")
+
+# ========= LOT SIZE =========
 def get_size(balance, price, symbol):
 
     size = (balance * RIESGO) / price
 
-    # lot sizes por símbolo (OKX)
     lot_sizes = {
         "BTC-USDT-SWAP": 0.001,
         "ETH-USDT-SWAP": 0.01,
@@ -87,7 +102,6 @@ def get_size(balance, price, symbol):
 
     lot = lot_sizes.get(symbol, 0.001)
 
-    # ajustar al múltiplo correcto
     size = max(size, lot)
     size = (size // lot) * lot
 
@@ -106,7 +120,8 @@ def place(symbol, side, price, balance):
         "instId": symbol,
         "tdMode": MARGIN_MODE,
         "side": side,
-        "ordType": "market",   # 🔥 ejecución inmediata
+        "posSide": "long" if side == "buy" else "short",
+        "ordType": "market",
         "sz": str(size)
     })
 
@@ -124,7 +139,7 @@ def place(symbol, side, price, balance):
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT OKX OPERATIVO (FIX LOT SIZE)")
+    log("🚀 BOT OKX FINAL OPERATIVO")
 
     while True:
         try:
@@ -137,8 +152,8 @@ def run():
 
             log(f"💰 Balance REAL: {balance}")
 
-            if balance < 2:
-                log("⚠️ saldo muy bajo")
+            if balance < 5:
+                log("⚠️ saldo bajo")
                 time.sleep(60)
                 continue
 
@@ -146,10 +161,12 @@ def run():
 
             for symbol in pares:
 
+                set_leverage(symbol)  # 🔥 CRÍTICO
+
                 df = get_klines(symbol)
                 price = df["close"].iloc[-1]
 
-                # 🔥 FORZAMOS BUY PARA TEST
+                # 🔥 FORZAMOS COMPRA PARA TEST
                 side = "buy"
 
                 log(f"🔥 Ejecutando {symbol}")
