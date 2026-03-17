@@ -25,7 +25,7 @@ ATR_PERIOD = 14
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ========= TIME CACHE =========
+# ========= TIME =========
 
 last_ts = None
 last_time = 0
@@ -35,13 +35,10 @@ def get_server_time_cached():
     now = time.time()
 
     if last_ts is None or now - last_time > 5:
-        try:
-            url = "https://www.okx.com/api/v5/public/time"
-            r = requests.get(url, timeout=5).json()
-            last_ts = r["data"][0]["ts"]
-            last_time = now
-        except Exception as e:
-            log(f"⚠️ Error obteniendo tiempo: {e}")
+        url = "https://www.okx.com/api/v5/public/time"
+        r = requests.get(url, timeout=5).json()
+        last_ts = r["data"][0]["ts"]
+        last_time = now
 
     return last_ts
 
@@ -56,14 +53,9 @@ def sign(ts, method, path, body=""):
 def headers(method, path, body=""):
     server_ts = get_server_time_cached()
 
-    if server_ts is None:
-        raise Exception("No se pudo obtener tiempo de OKX")
-
-    # convertir a timestamp correcto con milisegundos EXACTOS
     ts_sec = int(server_ts) / 1000
     dt = datetime.fromtimestamp(ts_sec, UTC)
 
-    # FORMATO EXACTO requerido por OKX
     ts = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
     return {
@@ -96,7 +88,7 @@ def atr(df):
     lc = abs(df["low"] - df["close"].shift())
     return pd.Series(np.maximum(hl, np.maximum(hc, lc))).rolling(ATR_PERIOD).mean()
 
-# ========= PRECISION =========
+# ========= PRECIO =========
 
 def format_price(price):
     if price > 100:
@@ -108,12 +100,26 @@ def format_price(price):
     else:
         return round(price, 6)
 
+# ========= LOT SIZE =========
+
+def get_lot_size(symbol):
+    url = f"{BASE_URL}/api/v5/public/instruments?instType=SWAP"
+    data = requests.get(url, timeout=10).json()["data"]
+
+    for inst in data:
+        if inst["instId"] == symbol:
+            return float(inst["lotSz"])
+
+    return 0.001
+
+def adjust_size(size, lot_size):
+    return max(lot_size, round(size / lot_size) * lot_size)
+
 # ========= ORDEN =========
 
 def place(symbol, side, price, size):
     try:
         if price <= 0:
-            log("⚠️ Precio inválido")
             return
 
         px = format_price(price)
@@ -137,12 +143,12 @@ def place(symbol, side, price, size):
         ).json()
 
         if r.get("code") != "0":
-            log(f"❌ Orden rechazada: {r}")
+            log(f"❌ Error orden: {r}")
         else:
-            log(f"✅ {symbol} {side.upper()} @ {px}")
+            log(f"✅ {symbol} {side.upper()} @ {px} size:{size}")
 
     except Exception as e:
-        log(f"❌ Error orden: {e}")
+        log(f"❌ Exception orden: {e}")
 
 # ========= BOT =========
 
@@ -167,8 +173,12 @@ def run():
 
             grid = [price + (i - niveles//2)*paso for i in range(niveles)]
 
-            size = max(0.001, round((CAPITAL * RIESGO) / price, 3))
+            lot_size = get_lot_size(symbol)
 
+            raw_size = (CAPITAL * RIESGO) / price
+            size = adjust_size(raw_size, lot_size)
+
+            log(f"📦 Size ajustado: {size} | Lot: {lot_size}")
             log("🚀 Ejecutando GRID REAL")
 
             for n in grid:
