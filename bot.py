@@ -2,7 +2,7 @@ import time
 import requests
 import numpy as np
 import pandas as pd
-import hmac, base64, json, os
+import hmac, base64, json, os, traceback
 import websocket
 import threading
 from datetime import datetime, UTC
@@ -74,8 +74,7 @@ def on_message(ws, message):
         if "data" in data:
             for d in data["data"]:
                 if "last" in d:
-                    symbol = d["instId"]
-                    price_data[symbol] = float(d["last"])
+                    price_data[d["instId"]] = float(d["last"])
     except:
         pass
 
@@ -119,17 +118,32 @@ def start_ws():
 # ========= MARKET =========
 def get_klines(symbol):
     try:
-        r = requests.get(f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100", timeout=5)
-        df = pd.DataFrame(r.json()["data"])
+        r = requests.get(
+            f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100",
+            timeout=5
+        )
+        data = r.json()
+
+        if "data" not in data:
+            return None
+
+        df = pd.DataFrame(data["data"])
+        if df.empty:
+            return None
+
         df = df.iloc[:, :6]
         df.columns = ["time","open","high","low","close","volume"]
         return df.astype(float)[::-1]
+
     except:
         return None
 
 # ========= IA =========
 def ai_signal(df):
     try:
+        if df is None or df.empty:
+            return None
+
         close = df["close"]
 
         ema50 = close.ewm(span=50).mean().iloc[-1]
@@ -141,31 +155,25 @@ def ai_signal(df):
         prob_buy = 0
         prob_sell = 0
 
-        if ema50 > ema200:
-            prob_buy += 0.4
-        else:
-            prob_sell += 0.4
+        prob_buy += 0.4 if ema50 > ema200 else 0
+        prob_sell += 0.4 if ema50 <= ema200 else 0
 
-        if momentum > 0:
-            prob_buy += 0.3
-        else:
-            prob_sell += 0.3
+        prob_buy += 0.3 if momentum > 0 else 0
+        prob_sell += 0.3 if momentum <= 0 else 0
 
         if volatility > close.iloc[-1] * 0.003:
             prob_buy += 0.1
             prob_sell += 0.1
 
-        if close.iloc[-1] > close.iloc[-3]:
-            prob_buy += 0.2
-        else:
-            prob_sell += 0.2
+        prob_buy += 0.2 if close.iloc[-1] > close.iloc[-3] else 0
+        prob_sell += 0.2 if close.iloc[-1] <= close.iloc[-3] else 0
 
         if prob_buy > 0.6:
             return "buy"
         elif prob_sell > 0.6:
             return "sell"
-        else:
-            return None
+
+        return None
 
     except:
         return None
@@ -175,44 +183,57 @@ martingale_step = 0
 MAX_MARTINGALA = 3
 
 def get_size(balance, price):
-    global martingale_step
+    if price is None or price <= 0:
+        return 0
+
     base = (balance * RIESGO) / price
     multiplier = 1.5 ** martingale_step
     return round(base * multiplier, 3)
 
-def update_martingale(win):
-    global martingale_step
-    if win:
-        martingale_step = 0
-    else:
-        if martingale_step < MAX_MARTINGALA:
-            martingale_step += 1
-
 # ========= BALANCE =========
 def get_balance():
     try:
-        r = requests.get(BASE_URL+"/api/v5/account/balance",
-                         headers=headers("GET","/api/v5/account/balance"), timeout=5)
-        for d in r.json()["data"][0]["details"]:
+        r = requests.get(
+            BASE_URL+"/api/v5/account/balance",
+            headers=headers("GET","/api/v5/account/balance"),
+            timeout=5
+        )
+        data = r.json()
+
+        if "data" not in data:
+            return CAPITAL_INICIAL
+
+        for d in data["data"][0]["details"]:
             if d["ccy"] == "USDT":
                 return float(d["eq"])
+
     except:
         pass
+
     return CAPITAL_INICIAL
 
 # ========= POSICIONES =========
 def get_positions(symbol):
     try:
-        r = requests.get(BASE_URL+f"/api/v5/account/positions?instId={symbol}",
-                         headers=headers("GET",f"/api/v5/account/positions?instId={symbol}"),
-                         timeout=5)
+        r = requests.get(
+            BASE_URL+f"/api/v5/account/positions?instId={symbol}",
+            headers=headers("GET",f"/api/v5/account/positions?instId={symbol}"),
+            timeout=5
+        )
         return r.json().get("data", [])
     except:
         return []
 
 # ========= ORDEN =========
 def place(symbol, side, price, balance):
+    if price is None or price <= 0:
+        log("❌ Precio inválido, no trade")
+        return
+
     size = get_size(balance, price)
+    if size <= 0:
+        log("❌ Tamaño inválido")
+        return
 
     body = json.dumps({
         "instId": symbol,
@@ -222,42 +243,63 @@ def place(symbol, side, price, balance):
         "sz": str(size)
     })
 
-    r = requests.post(BASE_URL+"/api/v5/trade/order",
-                      headers=headers("POST","/api/v5/trade/order",body),
-                      data=body, timeout=5).json()
-
-    log(f"{symbol} {side} → {r.get('code')} size:{size}")
+    try:
+        r = requests.post(
+            BASE_URL+"/api/v5/trade/order",
+            headers=headers("POST","/api/v5/trade/order",body),
+            data=body,
+            timeout=5
+        )
+        data = r.json()
+        log(f"{symbol} {side} → {data.get('code')} size:{size}")
+    except:
+        log("❌ Error enviando orden")
 
 # ========= CERRAR =========
 def close_all(symbol):
     positions = get_positions(symbol)
+
     for p in positions:
-        pos = float(p["pos"])
-        side = "sell" if pos > 0 else "buy"
+        try:
+            pos = float(p["pos"])
+            if pos == 0:
+                continue
 
-        body = json.dumps({
-            "instId": symbol,
-            "tdMode": MARGIN_MODE,
-            "side": side,
-            "ordType": "market",
-            "sz": str(abs(pos))
-        })
+            side = "sell" if pos > 0 else "buy"
 
-        requests.post(BASE_URL+"/api/v5/trade/order",
-                      headers=headers("POST","/api/v5/trade/order",body),
-                      data=body, timeout=5)
+            body = json.dumps({
+                "instId": symbol,
+                "tdMode": MARGIN_MODE,
+                "side": side,
+                "ordType": "market",
+                "sz": str(abs(pos))
+            })
+
+            requests.post(
+                BASE_URL+"/api/v5/trade/order",
+                headers=headers("POST","/api/v5/trade/order",body),
+                data=body,
+                timeout=5
+            )
+        except:
+            pass
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT IA PRO (FIXED WS)")
+    log("🚀 BOT IA PRO (ULTRA STABLE)")
 
     start_ws()
 
     while True:
         try:
             balance = get_balance()
-            pnl = (balance - CAPITAL_INICIAL) / CAPITAL_INICIAL
 
+            if balance <= 0:
+                log("⚠️ Balance inválido")
+                time.sleep(10)
+                continue
+
+            pnl = (balance - CAPITAL_INICIAL) / CAPITAL_INICIAL
             log(f"💰 Balance: {balance} | PnL: {round(pnl*100,2)}%")
 
             if pnl >= TP_GLOBAL:
@@ -277,7 +319,8 @@ def run():
             for symbol in SYMBOLS:
 
                 df = get_klines(symbol)
-                if df is None:
+                if df is None or df.empty:
+                    log(f"⚠️ Sin datos {symbol}")
                     continue
 
                 signal = ai_signal(df)
@@ -289,8 +332,7 @@ def run():
 
                 price = price_data.get(symbol)
 
-                # 🔥 FALLBACK SI WS FALLA
-                if not price:
+                if price is None:
                     log(f"⚠️ WS fallback {symbol}")
                     price = df["close"].iloc[-1]
 
@@ -302,8 +344,9 @@ def run():
 
             time.sleep(60)
 
-        except Exception as e:
-            log(f"❌ ERROR: {e}")
+        except Exception:
+            log("❌ ERROR DETALLADO:")
+            log(traceback.format_exc())
             time.sleep(30)
 
 # ========= START =========
