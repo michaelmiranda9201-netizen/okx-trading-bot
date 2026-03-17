@@ -1,10 +1,10 @@
-import time, json, hmac, base64, requests, math
+import time, json, hmac, base64, requests
 from datetime import datetime, UTC
 
 # ========= CONFIG =========
 API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
 SECRET_KEY = "DD0B0C2024162F50F4267C1D59C4AC81"
-PASSPHRASE ="WXcv8089@"
+PASSPHRASE = "WXcv8089@"
 
 BASE_URL = "https://www.okx.com"
 
@@ -35,17 +35,14 @@ def headers(method, path, body=""):
 
 # ========= BALANCE =========
 def get_balance():
-    try:
-        r = requests.get(
-            BASE_URL + "/api/v5/account/balance",
-            headers=headers("GET","/api/v5/account/balance")
-        ).json()
+    r = requests.get(
+        BASE_URL + "/api/v5/account/balance",
+        headers=headers("GET","/api/v5/account/balance")
+    ).json()
 
-        for d in r["data"][0]["details"]:
-            if d["ccy"] == "USDT":
-                return float(d["availEq"])
-    except:
-        return None
+    for d in r["data"][0]["details"]:
+        if d["ccy"] == "USDT":
+            return float(d["availEq"])
 
 # ========= PRECIO =========
 def get_price():
@@ -71,28 +68,28 @@ def set_leverage():
 
     log(f"⚙️ Leverage: {r}")
 
-# ========= SIZE (FIX REAL) =========
-def get_size(balance, price):
-    size = (balance * RIESGO) / price
+# ========= SIZE (CONTRATOS) =========
+def get_contracts(balance, price):
 
-    lot = 0.001  # BTC
+    usd_risk = balance * RIESGO
 
-    steps = math.floor(size / lot)
-    size = steps * lot
+    # ⚠️ contrato BTC ≈ 100 USD (aprox)
+    contract_value = 100  
 
-    if size < lot:
-        size = lot
+    contracts = int(usd_risk / contract_value)
 
-    # 🔥 devolver string exacto (sin error float)
-    return format(size, ".6f")
+    if contracts < 1:
+        contracts = 1
+
+    return str(contracts)
 
 # ========= ORDEN =========
 def place_order(side, balance):
 
     price = get_price()
-    size = get_size(balance, price)
+    contracts = get_contracts(balance, price)
 
-    log(f"📦 size calculado: {size}")
+    log(f"📦 contratos: {contracts}")
 
     body = json.dumps({
         "instId": SYMBOL,
@@ -100,7 +97,7 @@ def place_order(side, balance):
         "side": side,
         "posSide": "long" if side == "buy" else "short",
         "ordType": "market",
-        "sz": size
+        "sz": contracts   # 🔥 ENTERO
     })
 
     r = requests.post(
@@ -113,20 +110,14 @@ def place_order(side, balance):
 
 # ========= BOT =========
 def run():
-    log("🚀 BOT FINAL OKX (FIXED)")
+    log("🚀 BOT OKX FINAL (CONTRATOS)")
 
     set_leverage()
 
     while True:
         try:
             balance = get_balance()
-
-            if not balance:
-                log("❌ sin balance")
-                time.sleep(10)
-                continue
-
-            log(f"💰 Balance: {balance} USDT")
+            log(f"💰 Balance: {balance}")
 
             if balance < 5:
                 log("⚠️ saldo bajo")
@@ -135,7 +126,6 @@ def run():
 
             log("🚨 ENVIANDO ORDEN")
 
-            # 🔥 puedes cambiar a "sell" para probar short
             place_order("buy", balance)
 
             time.sleep(60)
