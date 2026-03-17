@@ -13,9 +13,9 @@ PASSPHRASE = "WXcv8089@"
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
 TIMEFRAME = '1m'
-RISK_PER_TRADE = 0.05  # 5% del balance
+RISK_PER_TRADE = 0.05
+GRID_LEVELS = 3
 LEVERAGE_MAX = 10
-GRID_LEVELS = 5
 
 # =========================
 # 🔌 CONEXIÓN OKX
@@ -25,9 +25,7 @@ exchange = ccxt.okx({
     'secret': API_SECRET,
     'password': PASSPHRASE,
     'enableRateLimit': True,
-    'options': {
-        'defaultType': 'swap'
-    }
+    'options': {'defaultType': 'swap'}
 })
 
 # =========================
@@ -43,89 +41,105 @@ def get_data(symbol):
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
     return df
 
-def calculate_indicators(df):
-    df['ema_fast'] = df['close'].ewm(span=20).mean()
-    df['ema_slow'] = df['close'].ewm(span=50).mean()
+def indicators(df):
+    df['ema20'] = df['close'].ewm(span=20).mean()
+    df['ema50'] = df['close'].ewm(span=50).mean()
     df['atr'] = (df['high'] - df['low']).rolling(14).mean()
     return df
 
-def get_trend(df):
-    if df['ema_fast'].iloc[-1] > df['ema_slow'].iloc[-1]:
-        return "bullish"
-    else:
-        return "bearish"
+def trend(df):
+    return "buy" if df['ema20'].iloc[-1] > df['ema50'].iloc[-1] else "sell"
 
-def calculate_leverage(atr, price):
+def dynamic_leverage(atr, price):
     vol = atr / price
-    lev = int(min(max(2, 1 / vol), LEVERAGE_MAX))
+    lev = int(min(max(3, 1/vol), LEVERAGE_MAX))
     return lev
 
-def calculate_position_size(balance, price):
-    risk_amount = balance * RISK_PER_TRADE
-    size = risk_amount / price
+# =========================
+# 💰 TAMAÑO CORRECTO OKX
+# =========================
+
+def calculate_size(symbol, balance, price, leverage):
+    risk = balance * RISK_PER_TRADE
+    position_value = risk * leverage
+
+    size = position_value / price
+
+    min_size = 0.01
+    if size < min_size:
+        size = min_size
+
+    size = float(exchange.amount_to_precision(symbol, size))
     return size
 
 # =========================
-# 📈 GRID DINÁMICO
+# 🧹 LIMPIAR ÓRDENES
 # =========================
 
-def create_grid_orders(symbol, price, atr, trend, balance):
-    grid_spacing = atr * 0.5
-    orders = []
+def cancel_orders(symbol):
+    try:
+        orders = exchange.fetch_open_orders(symbol)
+        for o in orders:
+            exchange.cancel_order(o['id'], symbol)
+    except:
+        pass
 
-    size = calculate_position_size(balance, price)
+# =========================
+# 📈 CREAR GRID
+# =========================
+
+def create_grid(symbol, price, atr, side, balance, leverage):
+    orders = []
+    spacing = atr * 0.5
+
+    size = calculate_size(symbol, balance, price, leverage)
+
+    if size < 0.01:
+        print(f"⚠️ Tamaño muy pequeño {symbol}")
+        return []
 
     for i in range(1, GRID_LEVELS + 1):
-        if trend == "bullish":
-            buy_price = price - (grid_spacing * i)
-            tp = price + (grid_spacing * i)
-            sl = price - (atr * 2)
 
-            orders.append({
-                'side': 'buy',
-                'price': buy_price,
-                'tp': tp,
-                'sl': sl,
-                'size': size
-            })
+        if side == "buy":
+            entry = price - spacing * i
+            tp = entry + spacing * 1.5
+            sl = entry - atr * 2
+
+            orders.append((entry, tp, sl, "buy"))
 
         else:
-            sell_price = price + (grid_spacing * i)
-            tp = price - (grid_spacing * i)
-            sl = price + (atr * 2)
+            entry = price + spacing * i
+            tp = entry - spacing * 1.5
+            sl = entry + atr * 2
 
-            orders.append({
-                'side': 'sell',
-                'price': sell_price,
-                'tp': tp,
-                'sl': sl,
-                'size': size
-            })
+            orders.append((entry, tp, sl, "sell"))
 
-    return orders
+    return orders, size
 
 # =========================
-# 🚀 EJECUCIÓN DE ÓRDENES
+# 🚀 EJECUTAR ÓRDENES
 # =========================
 
-def place_orders(symbol, orders, leverage):
+def place_orders(symbol, orders, size, leverage):
     try:
         exchange.set_leverage(leverage, symbol)
 
-        for order in orders:
-            side = order['side']
-            price = order['price']
-            size = order['size']
+        for entry, tp, sl, side in orders:
 
-            print(f"📌 {symbol} | {side.upper()} | Precio: {price:.2f} | Size: {size:.6f}")
+            print(f"📌 {symbol} | {side.upper()} | Entry: {entry:.2f} | Size: {size}")
 
-            exchange.create_limit_order(
+            exchange.create_order(
                 symbol=symbol,
+                type="limit",
                 side=side,
                 amount=size,
-                price=price,
+                price=entry,
                 params={
-                    "tdMode": "cross"
+                    "tdMode": "cross",
+                    "tpTriggerPx": str(tp),
+                    "tpOrdPx": str(tp),
+                    "slTriggerPx": str(sl),
+                    "slOrdPx": str(sl)
                 }
             )
 
@@ -133,10 +147,12 @@ def place_orders(symbol, orders, leverage):
         print(f"❌ Error orden: {e}")
 
 # =========================
-# 🔁 LOOP PRINCIPAL
+# 🔁 BOT LOOP
 # =========================
 
-def run_bot():
+def run():
+    print("🚀 BOT GRID FUTUROS OKX INICIADO")
+
     while True:
         try:
             balance = get_balance()
@@ -144,28 +160,31 @@ def run_bot():
 
             for symbol in SYMBOLS:
                 df = get_data(symbol)
-                df = calculate_indicators(df)
+                df = indicators(df)
 
                 price = df['close'].iloc[-1]
                 atr = df['atr'].iloc[-1]
-                trend = get_trend(df)
-
-                leverage = calculate_leverage(atr, price)
+                side = trend(df)
+                leverage = dynamic_leverage(atr, price)
 
                 print(f"\n📊 {symbol}")
                 print(f"Precio: {price}")
-                print(f"Tendencia: {trend}")
+                print(f"Tendencia: {side}")
                 print(f"Leverage: x{leverage}")
 
-                orders = create_grid_orders(symbol, price, atr, trend, balance)
+                # 🧹 limpiar grid viejo
+                cancel_orders(symbol)
 
-                place_orders(symbol, orders, leverage)
+                # 📈 crear nuevo grid
+                grid, size = create_grid(symbol, price, atr, side, balance, leverage)
 
-            # Espera 60 segundos
+                # 🚀 ejecutar
+                place_orders(symbol, grid, size, leverage)
+
             time.sleep(60)
 
         except Exception as e:
-            print(f"❌ Error general: {e}")
+            print(f"❌ ERROR GENERAL: {e}")
             time.sleep(30)
 
 # =========================
@@ -173,4 +192,4 @@ def run_bot():
 # =========================
 
 if __name__ == "__main__":
-    run_bot()
+    run()
