@@ -1,233 +1,176 @@
-import time, json, os, hmac, base64, threading, traceback
 import requests
+import time
+import hmac
+import base64
+import hashlib
 import pandas as pd
-import numpy as np
-import websocket
-from datetime import datetime, UTC
 
 # ========= CONFIG =========
-API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
-SECRET_KEY = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
-PASSPHRASE = os.getenv("WXcv8089@")
+API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
+API_SECRET = "DD0B0C2024162F50F4267C1D59C4AC81"
+PASSPHRASE = "WXcv8089@"
 
 BASE_URL = "https://www.okx.com"
 
-SYMBOLS = ["BTC-USDT-SWAP","ETH-USDT-SWAP","SOL-USDT-SWAP"]
+SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 
-RIESGO = 0.01
-TP_GLOBAL = 0.015
-SL_GLOBAL = -0.025
-
-TIMEFRAME = "5m"
-MARGIN_MODE = "isolated"
-
-price_data = {}
-ws_thread = None
-
-# ========= LOG =========
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
-
-# ========= WEBSOCKET =========
-def on_message(ws, message):
-    try:
-        data = json.loads(message)
-        if "data" in data:
-            for d in data["data"]:
-                if "last" in d:
-                    price_data[d["instId"]] = float(d["last"])
-    except:
-        pass
-
-def on_open(ws):
-    log("✅ WS conectado")
-    args = [{"channel":"tickers","instId":s} for s in SYMBOLS]
-    ws.send(json.dumps({"op":"subscribe","args":args}))
-
-def on_close(ws, code, msg):
-    log(f"⚠️ WS cerrado {code}")
-
-def start_ws():
-    global ws_thread
-
-    if ws_thread and ws_thread.is_alive():
-        return
-
-    def run():
-        while True:
-            try:
-                ws = websocket.WebSocketApp(
-                    "wss://ws.okx.com:8443/ws/v5/public",
-                    on_message=on_message,
-                    on_open=on_open,
-                    on_close=on_close
-                )
-                ws.run_forever(ping_interval=20)
-            except Exception as e:
-                log(f"WS error {e}")
-
-            time.sleep(5)
-
-    ws_thread = threading.Thread(target=run)
-    ws_thread.daemon = True
-    ws_thread.start()
-
-# ========= MARKET =========
-def get_klines(symbol):
-    try:
-        r = requests.get(
-            f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100",
-            timeout=5
-        )
-        df = pd.DataFrame(r.json()["data"])
-        df = df.iloc[:, :6]
-        df.columns = ["time","open","high","low","close","volume"]
-        return df.astype(float)[::-1]
-    except:
-        return None
-
-# ========= IA =========
-def ai_signal(df):
-    try:
-        if df is None or df.empty:
-            return None
-
-        close = df["close"]
-
-        ema50 = close.ewm(span=50).mean().iloc[-1]
-        ema200 = close.ewm(span=200).mean().iloc[-1]
-
-        trend = "bull" if ema50 > ema200 else "bear"
-        momentum = close.pct_change().iloc[-5:].mean()
-        structure = close.iloc[-1] > close.iloc[-3]
-
-        if trend == "bull" and momentum > 0 and structure:
-            return "buy"
-
-        if trend == "bear" and momentum < 0 and not structure:
-            return "sell"
-
-        return None
-
-    except:
-        return None
+CAPITAL = 50
+GRID_CAPITAL = 20
 
 # ========= AUTH =========
-def sign(ts, method, path, body=""):
-    msg = f"{ts}{method}{path}{body}"
-    return base64.b64encode(
-        hmac.new(SECRET_KEY.encode(), msg.encode(), digestmod="sha256").digest()
-    ).decode()
+def get_headers(method, path, body=""):
+    timestamp = str(time.time())
+    message = timestamp + method + path + body
 
-def headers(method, path, body=""):
-    # ✅ FIX Python 3.13 (sin utcnow)
-    ts = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00","Z")
+    signature = base64.b64encode(
+        hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256).digest()
+    ).decode()
 
     return {
         "OK-ACCESS-KEY": API_KEY,
-        "OK-ACCESS-SIGN": sign(ts, method, path, body),
-        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json"
     }
 
-# ========= BALANCE =========
-def get_balance():
-    try:
-        r = requests.get(
-            BASE_URL+"/api/v5/account/balance",
-            headers=headers("GET","/api/v5/account/balance"),
-            timeout=5
-        )
-        for d in r.json()["data"][0]["details"]:
-            if d["ccy"] == "USDT":
-                return float(d["eq"])
-    except:
-        return 50
+# ========= MARKET =========
+def get_klines(instId):
+    url = f"{BASE_URL}/api/v5/market/candles?instId={instId}&bar=5m&limit=100"
+    return requests.get(url).json()
 
-# ========= SIZE =========
-def get_size(balance, price):
-    if not price or price <= 0:
-        return 0
-    return round((balance * RIESGO) / price, 3)
+def get_price(instId):
+    url = f"{BASE_URL}/api/v5/market/ticker?instId={instId}"
+    return float(requests.get(url).json()['data'][0]['last'])
 
-# ========= TRADE =========
-def place(symbol, side, price, balance):
-    size = get_size(balance, price)
+# ========= ACCOUNT =========
+def set_leverage(instId, lev):
+    path = "/api/v5/account/set-leverage"
+    body = f'{{"instId":"{instId}","lever":"{lev}","mgnMode":"isolated"}}'
+    headers = get_headers("POST", path, body)
+    requests.post(BASE_URL + path, headers=headers, data=body)
 
-    if size <= 0:
-        log("❌ tamaño inválido")
-        return
+# ========= STRATEGY =========
+def prepare_df(data):
+    df = pd.DataFrame(data['data'])
+    df = df.iloc[::-1]
 
-    body = json.dumps({
-        "instId": symbol,
-        "tdMode": MARGIN_MODE,
-        "side": side,
-        "ordType": "market",
-        "sz": str(size)
-    })
+    df.columns = ["time","open","high","low","close","vol","volCcy","volCcyQuote","confirm"]
 
-    try:
-        requests.post(
-            BASE_URL+"/api/v5/trade/order",
-            headers=headers("POST","/api/v5/trade/order",body),
-            data=body,
-            timeout=5
-        )
-        log(f"🔥 {symbol} {side} ejecutado")
-    except:
-        log("❌ error orden")
+    df["close"] = df["close"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
 
-# ========= BOT =========
+    return df
+
+def indicators(df):
+    df["ema50"] = df["close"].ewm(span=50).mean()
+    df["ema200"] = df["close"].ewm(span=200).mean()
+    df["atr"] = (df["high"] - df["low"]).rolling(14).mean()
+    return df
+
+def detect_range(df):
+    high = df["high"].rolling(50).max().iloc[-1]
+    low = df["low"].rolling(50).min().iloc[-1]
+    return low, high
+
+def build_grid(price, low, high, atr):
+    range_size = high - low
+
+    levels = int(range_size / (atr * 0.5))
+    levels = max(3, min(levels, 6))
+
+    step = range_size / levels
+
+    return step, levels
+
+def dynamic_leverage(atr, price):
+    if atr / price > 0.01:
+        return 3
+    return 5
+
+def dynamic_sl_tp(low, atr, step):
+    sl = low - atr * 1.2
+    tp = step * 0.7
+    return sl, tp
+
+# ========= EXECUTION =========
+def place_order(instId, side, price, size):
+    path = "/api/v5/trade/order"
+
+    body = f'''
+    {{
+        "instId": "{instId}",
+        "tdMode": "isolated",
+        "side": "{side}",
+        "ordType": "limit",
+        "px": "{price}",
+        "sz": "{size}"
+    }}
+    '''
+
+    headers = get_headers("POST", path, body)
+    requests.post(BASE_URL + path, headers=headers, data=body)
+
+def place_grid(instId, price, step, levels):
+    qty = GRID_CAPITAL / levels / price
+
+    for i in range(1, levels + 1):
+        buy = price - step * i
+        sell = price + step * i
+
+        place_order(instId, "buy", round(buy, 2), round(qty, 3))
+        place_order(instId, "sell", round(sell, 2), round(qty, 3))
+
+# ========= MAIN =========
 def run():
-    log("🏦 BOT INSTITUCIONAL (FIXED)")
-
-    start_ws()
-
     while True:
-        try:
-            balance = get_balance()
-            pnl = (balance - 50) / 50
+        best_symbol = None
+        best_vol = 0
 
-            log(f"💰 {balance} USDT | PnL {round(pnl*100,2)}%")
+        # 🔍 Radar
+        for sym in SYMBOLS:
+            try:
+                data = get_klines(sym)
+                df = prepare_df(data)
+                df = indicators(df)
 
-            if pnl <= SL_GLOBAL:
-                log("🛑 STOP GLOBAL")
-                time.sleep(300)
+                atr = df["atr"].iloc[-1]
+
+                if atr > best_vol:
+                    best_vol = atr
+                    best_symbol = sym
+            except:
                 continue
 
-            if pnl >= TP_GLOBAL:
-                log("🎯 TAKE PROFIT")
-                time.sleep(120)
-                continue
+        if best_symbol:
+            print(f"\n🔥 OPERANDO: {best_symbol}")
 
-            for symbol in SYMBOLS:
+            data = get_klines(best_symbol)
+            df = prepare_df(data)
+            df = indicators(df)
 
-                df = get_klines(symbol)
-                if df is None:
-                    continue
+            price = df["close"].iloc[-1]
+            atr = df["atr"].iloc[-1]
 
-                signal = ai_signal(df)
-                if not signal:
-                    continue
+            low, high = detect_range(df)
+            step, levels = build_grid(price, low, high, atr)
 
-                price = price_data.get(symbol)
+            lev = dynamic_leverage(atr, price)
+            set_leverage(best_symbol, lev)
 
-                if not price:
-                    log(f"⚠️ fallback {symbol}")
-                    price = df["close"].iloc[-1]
+            sl, tp = dynamic_sl_tp(low, atr, step)
 
-                log(f"📡 {symbol} → {signal}")
+            print(f"Precio: {price}")
+            print(f"Rango: {low} - {high}")
+            print(f"Grid: {levels} niveles | Step: {step}")
+            print(f"Leverage: {lev}x")
+            print(f"SL: {sl} | TP: {tp}")
 
-                place(symbol, signal, price, balance)
+            place_grid(best_symbol, price, step, levels)
 
-                break
+        time.sleep(300)
 
-            time.sleep(60)
-
-        except Exception:
-            log(traceback.format_exc())
-            time.sleep(30)
-
+# ========= START =========
 if __name__ == "__main__":
     run()
