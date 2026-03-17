@@ -13,12 +13,13 @@ PASSPHRASE = "WXcv8089@"
 
 BASE_URL = "https://www.okx.com"
 
-CAPITAL = 50
+CAPITAL_INICIAL = 50
 RIESGO = 0.05
-TIMEFRAME = "5m"
+TP_GLOBAL = 0.01
+SL_GLOBAL = -0.02
 
+TIMEFRAME = "5m"
 MARGIN_MODE = "isolated"
-ATR_PERIOD = 14
 
 # ========= LOG =========
 
@@ -30,19 +31,12 @@ def log(msg):
 last_ts = None
 last_time = 0
 
-def get_server_time_cached():
+def get_server_time():
     global last_ts, last_time
-    now = time.time()
-
-    if last_ts is None or now - last_time > 5:
-        try:
-            url = "https://www.okx.com/api/v5/public/time"
-            r = requests.get(url, timeout=5).json()
-            last_ts = r["data"][0]["ts"]
-            last_time = now
-        except Exception as e:
-            log(f"⚠️ Error tiempo: {e}")
-
+    if last_ts is None or time.time() - last_time > 5:
+        r = requests.get(BASE_URL + "/api/v5/public/time").json()
+        last_ts = r["data"][0]["ts"]
+        last_time = time.time()
     return last_ts
 
 # ========= AUTH =========
@@ -54,12 +48,7 @@ def sign(ts, method, path, body=""):
     ).decode()
 
 def headers(method, path, body=""):
-    server_ts = get_server_time_cached()
-
-    if server_ts is None:
-        raise Exception("No hay timestamp")
-
-    ts_sec = int(server_ts) / 1000
+    ts_sec = int(get_server_time()) / 1000
     dt = datetime.fromtimestamp(ts_sec, UTC)
     ts = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
@@ -73,129 +62,141 @@ def headers(method, path, body=""):
 
 # ========= MARKET =========
 
-def get_klines(symbol):
-    url = f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100"
-    data = requests.get(url, timeout=10).json()["data"]
+def get_pairs():
+    r = requests.get(BASE_URL + "/api/v5/market/tickers?instType=SWAP").json()
+    df = pd.DataFrame(r["data"])
+    df["vol"] = df["vol24h"].astype(float)
+    return df.sort_values("vol", ascending=False).head(5)["instId"].tolist()
 
-    df = pd.DataFrame(data)
+def get_klines(symbol):
+    r = requests.get(f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={TIMEFRAME}&limit=100").json()
+    df = pd.DataFrame(r["data"])
     df = df.iloc[:, :6]
     df.columns = ["time","open","high","low","close","volume"]
-
     return df.astype(float)[::-1]
 
 # ========= INDICADORES =========
 
-def ema(df,p): return df["close"].ewm(span=p).mean()
+def ema(df, p):
+    return df["close"].ewm(span=p).mean()
 
 def atr(df):
-    hl = df["high"] - df["low"]
-    hc = abs(df["high"] - df["close"].shift())
-    lc = abs(df["low"] - df["close"].shift())
-    return pd.Series(np.maximum(hl, np.maximum(hc, lc))).rolling(ATR_PERIOD).mean()
+    return (df["high"] - df["low"]).rolling(14).mean()
 
-# ========= PRECIO =========
+# ========= IA SCORE =========
 
-def format_price(price):
-    if price > 100:
-        return round(price, 2)
-    elif price > 1:
-        return round(price, 3)
-    elif price > 0.01:
-        return round(price, 4)
-    else:
-        return round(price, 6)
+def score(df):
+    e50 = ema(df,50).iloc[-1]
+    e200 = ema(df,200).iloc[-1]
+    price = df["close"].iloc[-1]
+    momentum = df["close"].pct_change().iloc[-5:].mean()
 
-# ========= LOT SIZE =========
+    s = 0
+    if e50 > e200: s += 30
+    if price > e50: s += 20
+    if momentum > 0: s += 20
 
-def get_lot_size(symbol):
-    url = f"{BASE_URL}/api/v5/public/instruments?instType=SWAP"
-    data = requests.get(url, timeout=10).json()["data"]
+    vol = atr(df).iloc[-1] / price
+    if vol > 0.005: s += 20
 
-    for inst in data:
-        if inst["instId"] == symbol:
-            return float(inst["lotSz"])
+    return s
 
-    return 0.001
+# ========= BALANCE =========
 
-def adjust_size(size, lot_size):
-    return max(lot_size, round(size / lot_size) * lot_size)
+def get_balance():
+    r = requests.get(BASE_URL+"/api/v5/account/balance", headers=headers("GET","/api/v5/account/balance")).json()
+    for d in r["data"][0]["details"]:
+        if d["ccy"] == "USDT":
+            return float(d["eq"])
+    return CAPITAL_INICIAL
+
+# ========= POSICIONES =========
+
+def get_positions(symbol):
+    r = requests.get(BASE_URL+f"/api/v5/account/positions?instId={symbol}",
+                     headers=headers("GET",f"/api/v5/account/positions?instId={symbol}")).json()
+    return r.get("data", [])
 
 # ========= ORDEN =========
 
 def place(symbol, side, price, size):
-    try:
-        if price <= 0:
-            return
+    body = json.dumps({
+        "instId": symbol,
+        "tdMode": MARGIN_MODE,
+        "side": side,
+        "ordType": "limit",
+        "px": str(round(price,2)),
+        "sz": str(size)
+    })
 
-        px = format_price(price)
+    r = requests.post(BASE_URL+"/api/v5/trade/order",
+                      headers=headers("POST","/api/v5/trade/order",body),
+                      data=body).json()
 
-        body = json.dumps({
-            "instId": symbol,
-            "tdMode": MARGIN_MODE,
-            "side": side,
-            "ordType": "limit",
-            "px": str(px),
-            "sz": str(size)
-        })
-
-        r = requests.post(
-            BASE_URL + "/api/v5/trade/order",
-            headers=headers("POST","/api/v5/trade/order",body),
-            data=body,
-            timeout=10
-        ).json()
-
-        if r.get("code") != "0":
-            log(f"❌ Error orden: {r}")
-        else:
-            log(f"✅ {symbol} {side.upper()} @ {px} size:{size}")
-
-    except Exception as e:
-        log(f"❌ Exception orden: {e}")
+    log(f"{symbol} {side} → {r.get('code')}")
 
 # ========= BOT =========
 
 def run():
-    symbol = "BTC-USDT-SWAP"
+    log("🔥 BOT PRO MULTI-PAR ACTIVADO")
 
     while True:
         try:
-            df = get_klines(symbol)
+            balance = get_balance()
+            pnl = (balance - CAPITAL_INICIAL) / CAPITAL_INICIAL
 
+            log(f"💰 Balance: {balance} | PnL: {round(pnl*100,2)}%")
+
+            if pnl >= TP_GLOBAL:
+                log("🎯 TP alcanzado")
+                break
+
+            if pnl <= SL_GLOBAL:
+                log("🛑 SL alcanzado")
+                break
+
+            pares = get_pairs()
+
+            mejor = None
+            mejor_score = 0
+
+            for p in pares:
+                df = get_klines(p)
+                s = score(df)
+
+                if s > mejor_score:
+                    mejor_score = s
+                    mejor = p
+
+            if mejor_score < 60:
+                log("⏳ Sin oportunidades fuertes")
+                time.sleep(60)
+                continue
+
+            if get_positions(mejor):
+                log("⏳ Ya hay trade activo")
+                time.sleep(60)
+                continue
+
+            df = get_klines(mejor)
             price = df["close"].iloc[-1]
             atr_val = atr(df).iloc[-1]
 
-            if np.isnan(atr_val):
-                log("⚠️ ATR inválido")
-                time.sleep(30)
-                continue
-
             niveles = 5
-            rango = atr_val * 1.5
-            paso = rango / niveles
+            paso = (atr_val * 1.5) / niveles
 
-            grid = [price + (i - niveles//2)*paso for i in range(niveles)]
+            log(f"🚀 Operando {mejor} SCORE {mejor_score}")
 
-            lot_size = get_lot_size(symbol)
-            raw_size = (CAPITAL * RIESGO) / price
-            size = adjust_size(raw_size, lot_size)
-
-            log(f"📦 Size: {size} | Lot: {lot_size}")
-            log("🚀 GRID ACTIVO")
-
-            for n in grid:
-                if n < price:
-                    place(symbol, "buy", n, size)
-                else:
-                    place(symbol, "sell", n, size)
+            for i in range(niveles):
+                level = price + (i - niveles//2)*paso
+                side = "buy" if level < price else "sell"
+                place(mejor, side, level, 0.01)
 
             time.sleep(120)
 
         except Exception as e:
-            log(f"❌ ERROR GENERAL: {e}")
+            log(f"❌ ERROR: {e}")
             time.sleep(30)
-
-# ========= START =========
 
 if __name__ == "__main__":
     run()
