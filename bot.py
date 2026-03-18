@@ -3,7 +3,7 @@ import time
 import pandas as pd
 
 # =========================
-# CONFIG
+# 🔐 CONFIG
 # =========================
 API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
 API_SECRET = "DD0B0C2024162F50F4267C1D59C4AC81"
@@ -12,7 +12,11 @@ PASSPHRASE = "WXcv8089@"
 SYMBOLS = [
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
-    "SOL/USDT:USDT"
+    "SOL/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "LINK/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "XRP/USDT:USDT"
 ]
 
 RISK_BASE = 0.05
@@ -23,7 +27,7 @@ start_balance = None
 last_trade_time = 0
 
 # =========================
-# OKX
+# 🔌 OKX
 # =========================
 exchange = ccxt.okx({
     'apiKey': API_KEY,
@@ -37,7 +41,7 @@ exchange = ccxt.okx({
 })
 
 # =========================
-# DATA
+# 📊 DATA
 # =========================
 def get_data(symbol):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=150)
@@ -52,7 +56,7 @@ def get_data(symbol):
     return df
 
 # =========================
-# 🧠 DETECTAR TIPO DE MERCADO
+# 🧠 DETECTAR MERCADO
 # =========================
 def detect_market(df):
     last = df.iloc[-1]
@@ -82,7 +86,7 @@ def get_signal(df):
     return "buy" if last['ema20'] > last['ema50'] else "sell"
 
 # =========================
-# 🧠 SELECCIÓN INTELIGENTE
+# 🧠 SELECCIÓN DE ACTIVO
 # =========================
 def choose_symbol():
     best = None
@@ -94,22 +98,31 @@ def choose_symbol():
         atr = df['atr'].iloc[-1]
         price = df['close'].iloc[-1]
         momentum = abs(df['momentum'].iloc[-1])
+        volume = df['volume'].iloc[-1]
+        vol_avg = df['vol_avg'].iloc[-1]
 
-        score = (atr / price) * 2 + momentum
+        # filtro mínimo
+        if volume < vol_avg:
+            continue
 
-        # 🔥 BONUS PARA SOL
-        if "SOL" in s:
+        score = (atr / price) * 2 + momentum + (volume / vol_avg)
+
+        if "SOL" in s or "AVAX" in s:
             score *= 1.2
 
         if score > best_score:
             best_score = score
             best = s
 
-    print(f"🎯 Operando: {best}")
+    if best is None:
+        print("⏸ Ningún activo óptimo")
+        return None
+
+    print(f"🎯 Activo seleccionado: {best}")
     return best
 
 # =========================
-# ⚙️ LEVERAGE + RISK ADAPTATIVO
+# ⚙️ RISK + LEVERAGE
 # =========================
 def get_risk_and_lev(market_type, atr, price):
     vol = atr / price
@@ -129,7 +142,7 @@ def set_leverage(symbol, lev):
     )
 
 # =========================
-# SIZE
+# 💰 SIZE
 # =========================
 def size_calc(symbol, balance, price, risk, lev):
     value = balance * risk * lev
@@ -141,7 +154,7 @@ def size_calc(symbol, balance, price, risk, lev):
     return float(exchange.amount_to_precision(symbol, size))
 
 # =========================
-# POSICIÓN
+# 📊 POSICIÓN
 # =========================
 def get_position(symbol):
     try:
@@ -154,7 +167,7 @@ def get_position(symbol):
     return None
 
 # =========================
-# ENTRY
+# 🚀 ENTRY
 # =========================
 def enter(symbol, side, size):
     exchange.create_order(
@@ -167,7 +180,7 @@ def enter(symbol, side, size):
     print(f"🚀 ENTRY {side} {symbol}")
 
 # =========================
-# 🎯 GESTIÓN ADAPTATIVA
+# 🎯 GESTIÓN
 # =========================
 def manage(symbol, pos, atr, market_type):
     entry = float(pos['entryPrice'])
@@ -176,10 +189,8 @@ def manage(symbol, pos, atr, market_type):
     mark = float(pos['markPrice'])
 
     pnl = (mark - entry) * size if side == "long" else (entry - mark) * size
-
     exit_side = "sell" if side == "long" else "buy"
 
-    # 🔥 PROFIT SEGÚN MODO
     if market_type == "trend":
         target = atr * size * 2.5
     elif market_type == "normal":
@@ -200,7 +211,7 @@ def manage(symbol, pos, atr, market_type):
         print("💵 PROFIT CERRADO")
 
 # =========================
-# 🛑 CONTROL GLOBAL
+# 🛑 RIESGO GLOBAL
 # =========================
 def risk_control(balance):
     global start_balance
@@ -217,12 +228,12 @@ def risk_control(balance):
     return True
 
 # =========================
-# LOOP
+# 🔁 LOOP
 # =========================
 def run():
     global last_trade_time
 
-    print("🔥 BOT ADAPTATIVO NIVEL PRO")
+    print("🔥 BOT PRO ADAPTATIVO + MULTI-ACTIVOS")
 
     while True:
         try:
@@ -232,8 +243,12 @@ def run():
                 break
 
             symbol = choose_symbol()
-            df = get_data(symbol)
 
+            if symbol is None:
+                time.sleep(20)
+                continue
+
+            df = get_data(symbol)
             market_type = detect_market(df)
             signal = get_signal(df)
 
@@ -267,5 +282,8 @@ def run():
             print(f"❌ ERROR: {e}")
             time.sleep(10)
 
+# =========================
+# ▶️ START
+# =========================
 if __name__ == "__main__":
     run()
