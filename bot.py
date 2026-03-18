@@ -10,7 +10,7 @@ API_SECRET = "DD0B0C2024162F50F4267C1D59C4AC81"
 PASSPHRASE = "WXcv8089@"
 
 MAX_DRAWDOWN = 0.06
-TOP_SYMBOLS = 15
+GRID_LEVELS = 2  # 🔥 reducido para evitar error
 
 start_balance = None
 
@@ -29,29 +29,24 @@ exchange = ccxt.okx({
 })
 
 # =========================
+# BALANCE SEGURO
+# =========================
+def get_safe_balance():
+    balance = exchange.fetch_balance()['USDT']['free']
+    return balance * 0.3  # 🔥 solo usar 30%
+
+# =========================
 # TIMEFRAME DINÁMICO
 # =========================
 def choose_timeframe(atr, price):
     vol = atr / price
+
     if vol < 0.002:
         return '1m'
     elif vol < 0.005:
         return '3m'
     else:
         return '5m'
-
-# =========================
-# OBTENER TODOS LOS PARES
-# =========================
-def get_all_symbols():
-    markets = exchange.load_markets()
-    symbols = []
-
-    for m in markets:
-        if "USDT" in m and ":USDT" in m:
-            symbols.append(m)
-
-    return symbols
 
 # =========================
 # DATA
@@ -68,53 +63,14 @@ def get_data(symbol):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
 
+    df['ema20'] = df['close'].ewm(span=20).mean()
+    df['ema50'] = df['close'].ewm(span=50).mean()
     df['atr'] = (df['high'] - df['low']).rolling(14).mean()
-    df['momentum'] = df['close'].pct_change(3)
 
     return df
 
 # =========================
-# SCANNER PRO
-# =========================
-def scan_market():
-    symbols = get_all_symbols()
-
-    ranking = []
-
-    for s in symbols[:30]:  # limitar para velocidad
-        try:
-            df = get_data(s)
-
-            atr = df['atr'].iloc[-1]
-            price = df['close'].iloc[-1]
-            momentum = abs(df['momentum'].iloc[-1])
-            volume = df['volume'].iloc[-1]
-
-            score = (atr / price) * 2 + momentum + (volume)
-
-            ranking.append((s, score))
-
-        except:
-            continue
-
-    ranking = sorted(ranking, key=lambda x: x[1], reverse=True)
-
-    return [x[0] for x in ranking[:TOP_SYMBOLS]]
-
-# =========================
-# ELEGIR MEJOR
-# =========================
-def choose_symbol():
-    top = scan_market()
-
-    best = top[0]
-
-    print(f"🎯 Mejor activo: {best}")
-
-    return best
-
-# =========================
-# LEVERAGE
+# LEVERAGE DINÁMICO
 # =========================
 def dynamic_leverage(atr, price):
     vol = atr / price
@@ -127,11 +83,28 @@ def dynamic_leverage(atr, price):
         return 5
 
 def set_leverage(symbol, lev):
-    exchange.set_leverage(
-        lev,
-        exchange.market(symbol)['id'],
-        params={"mgnMode": "isolated"}
-    )
+    try:
+        exchange.set_leverage(
+            lev,
+            exchange.market(symbol)['id'],
+            params={"mgnMode": "isolated"}
+        )
+    except:
+        pass
+
+# =========================
+# SIZE SEGURO
+# =========================
+def calculate_size(symbol, balance, price, leverage):
+    usable = balance * 0.5
+    position_value = usable * leverage
+
+    size = position_value / price
+
+    if size < 0.01:
+        size = 0.01
+
+    return float(exchange.amount_to_precision(symbol, size))
 
 # =========================
 # SNIPER
@@ -155,15 +128,25 @@ def create_grid(df, balance):
     atr = df['atr'].iloc[-1]
 
     spacing = atr * 0.4
-    size = max(0.01, balance * 0.02 / price)
+    size = max(0.01, balance * 0.01 / price)
 
     orders = []
 
-    for i in range(1, 3):
+    for i in range(1, GRID_LEVELS + 1):
         orders.append(("buy", price - spacing * i))
         orders.append(("sell", price + spacing * i))
 
     return orders, size
+
+# =========================
+# LIMPIAR
+# =========================
+def cancel_orders(symbol):
+    try:
+        for o in exchange.fetch_open_orders(symbol):
+            exchange.cancel_order(o['id'], symbol)
+    except:
+        pass
 
 # =========================
 # RIESGO
@@ -186,34 +169,44 @@ def risk_control(balance):
 # LOOP
 # =========================
 def run():
-    print("🔥 BOT SUPREMO ACTIVADO")
+    print("🔥 BOT CORREGIDO ACTIVADO")
+
+    SYMBOL = "BTC/USDT:USDT"  # 🔥 empezar simple
 
     while True:
         try:
-            balance = exchange.fetch_balance()['USDT']['free']
+            balance_total = exchange.fetch_balance()['USDT']['free']
 
-            if not risk_control(balance):
+            if balance_total < 5:
+                print("⚠️ Balance bajo")
+                time.sleep(30)
+                continue
+
+            if not risk_control(balance_total):
                 break
 
-            symbol = choose_symbol()
-            df = get_data(symbol)
+            balance = get_safe_balance()
+
+            df = get_data(SYMBOL)
 
             price = df['close'].iloc[-1]
             atr = df['atr'].iloc[-1]
 
             lev = dynamic_leverage(atr, price)
-            set_leverage(symbol, lev)
 
-            print(f"\n🎯 {symbol} | Lev x{lev}")
+            cancel_orders(SYMBOL)
+            set_leverage(SYMBOL, lev)
+
+            print(f"\n🎯 {SYMBOL} | Lev x{lev}")
 
             # SNIPER
             signal = sniper_signal(df)
 
             if signal:
-                size = max(0.01, balance * 0.03 / price)
+                size = calculate_size(SYMBOL, balance, price, lev)
 
                 exchange.create_order(
-                    symbol=symbol,
+                    symbol=SYMBOL,
                     type="market",
                     side=signal,
                     amount=size,
@@ -225,11 +218,11 @@ def run():
                 continue
 
             # GRID
-            orders, size = create_grid(df, balance)
+            grid, size = create_grid(df, balance)
 
-            for side, p in orders:
+            for side, p in grid:
                 exchange.create_order(
-                    symbol=symbol,
+                    symbol=SYMBOL,
                     type="limit",
                     side=side,
                     amount=size,
@@ -243,5 +236,8 @@ def run():
             print(f"❌ ERROR: {e}")
             time.sleep(10)
 
+# =========================
+# START
+# =========================
 if __name__ == "__main__":
     run()
