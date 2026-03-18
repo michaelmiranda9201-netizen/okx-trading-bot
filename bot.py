@@ -3,7 +3,7 @@ import time
 import pandas as pd
 
 # =========================
-# 🔐 CONFIG
+# CONFIG
 # =========================
 API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
 API_SECRET = "DD0B0C2024162F50F4267C1D59C4AC81"
@@ -13,21 +13,16 @@ SYMBOLS = [
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
     "SOL/USDT:USDT",
-    "AVAX/USDT:USDT",
-    "LINK/USDT:USDT",
-    "DOGE/USDT:USDT",
-    "XRP/USDT:USDT"
+    "AVAX/USDT:USDT"
 ]
 
+GRID_LEVELS = 3
 MAX_DRAWDOWN = 0.06
-COOLDOWN = 30
 
 start_balance = None
-last_trade_time = 0
-stop_mode = False
 
 # =========================
-# 🔌 OKX
+# OKX
 # =========================
 exchange = ccxt.okx({
     'apiKey': API_KEY,
@@ -41,7 +36,7 @@ exchange = ccxt.okx({
 })
 
 # =========================
-# 📊 DATA
+# DATA
 # =========================
 def get_data(symbol):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=150)
@@ -50,43 +45,69 @@ def get_data(symbol):
     df['ema20'] = df['close'].ewm(span=20).mean()
     df['ema50'] = df['close'].ewm(span=50).mean()
     df['atr'] = (df['high'] - df['low']).rolling(14).mean()
-    df['momentum'] = df['close'].pct_change(3)
-    df['vol_avg'] = df['volume'].rolling(20).mean()
 
     return df
 
 # =========================
-# 🧠 DETECTAR MERCADO
+# MERCADO
 # =========================
-def detect_market(df):
+def market_type(df):
     last = df.iloc[-1]
+    trend = abs(last['ema20'] - last['ema50'])
 
-    strength = abs(last['ema20'] - last['ema50'])
-    volatility = last['atr'] / last['close']
-
-    if strength > last['atr'] * 0.8:
+    if trend > last['atr']:
         return "trend"
-    elif volatility < 0.002:
-        return "dead"
     else:
-        return "normal"
+        return "range"
 
 # =========================
-# 🧠 SEÑAL
+# LEVERAGE DINÁMICO REAL
 # =========================
-def get_signal(df):
-    last = df.iloc[-1]
+def dynamic_leverage(atr, price):
+    vol = atr / price
 
-    if abs(last['momentum']) < 0.001:
-        return None
+    if vol < 0.002:
+        return 10
+    elif vol < 0.005:
+        return 7
+    else:
+        return 5
 
-    if last['volume'] < last['vol_avg']:
-        return None
+def set_leverage(symbol, lev):
+    try:
+        market = exchange.market(symbol)
 
-    return "buy" if last['ema20'] > last['ema50'] else "sell"
+        exchange.set_leverage(
+            lev,
+            market['id'],
+            params={"mgnMode": "isolated"}
+        )
+
+        print(f"⚙️ Leverage x{lev} AISLADO")
+
+    except Exception as e:
+        print(f"❌ Error leverage: {e}")
 
 # =========================
-# 🧠 SELECCIÓN DE ACTIVO
+# LIMPIEZA
+# =========================
+def cancel_all(symbol):
+    try:
+        for o in exchange.fetch_open_orders(symbol):
+            exchange.cancel_order(o['id'], symbol)
+
+        try:
+            exchange.private_post_trade_cancel_algos({
+                "instId": exchange.market(symbol)['id']
+            })
+        except:
+            pass
+
+    except:
+        pass
+
+# =========================
+# SELECCIÓN
 # =========================
 def choose_symbol():
     best = None
@@ -95,224 +116,144 @@ def choose_symbol():
     for s in SYMBOLS:
         df = get_data(s)
 
-        atr = df['atr'].iloc[-1]
-        price = df['close'].iloc[-1]
-        momentum = abs(df['momentum'].iloc[-1])
-        volume = df['volume'].iloc[-1]
-        vol_avg = df['vol_avg'].iloc[-1]
-
-        if volume < vol_avg:
-            continue
-
-        score = (atr / price) * 2 + momentum + (volume / vol_avg)
-
-        if "SOL" in s or "AVAX" in s:
-            score *= 1.2
+        score = df['atr'].iloc[-1] / df['close'].iloc[-1]
 
         if score > best_score:
             best_score = score
             best = s
 
-    if best is None:
-        print("⏸ Ningún activo óptimo")
-        return None
-
-    print(f"🎯 Activo seleccionado: {best}")
     return best
 
 # =========================
-# ⚙️ RISK + LEVERAGE
+# GRID
 # =========================
-def get_risk_and_lev(market_type, atr, price):
-    if market_type == "trend":
-        return 0.08, 10
-    elif market_type == "normal":
-        return 0.06, 7
-    else:
-        return 0.03, 5
+def create_grid(df, balance):
+    price = df['close'].iloc[-1]
+    atr = df['atr'].iloc[-1]
 
-def set_leverage(symbol, lev):
-    exchange.set_leverage(
-        lev,
-        exchange.market(symbol)['id'],
-        params={"mgnMode": "isolated"}
-    )
+    spacing = atr * 0.4
+    size = max(0.01, balance * 0.02 / price)
+
+    orders = []
+
+    for i in range(1, GRID_LEVELS + 1):
+        orders.append(("buy", price - spacing * i))
+        orders.append(("sell", price + spacing * i))
+
+    return orders, size
+
+def place_grid(symbol, orders, size):
+    for side, price in orders:
+        try:
+            exchange.create_order(
+                symbol=symbol,
+                type="limit",
+                side=side,
+                amount=size,
+                price=price,
+                params={"tdMode": "isolated"}
+            )
+            print(f"📌 GRID {side} @ {price:.2f}")
+        except Exception as e:
+            print(e)
 
 # =========================
-# 💰 SIZE
+# SNIPER
 # =========================
-def size_calc(symbol, balance, price, risk, lev):
-    value = balance * risk * lev
-    size = value / price
+def sniper_signal(df):
+    last = df.iloc[-1]
 
-    if size < 0.01:
-        size = 0.01
+    high = df['high'].rolling(20).max().iloc[-1]
+    low = df['low'].rolling(20).min().iloc[-1]
 
-    return float(exchange.amount_to_precision(symbol, size))
+    price = last['close']
 
-# =========================
-# 📊 POSICIÓN
-# =========================
-def get_position(symbol):
-    try:
-        pos = exchange.fetch_positions([symbol])
-        for p in pos:
-            if float(p['contracts']) > 0:
-                return p
-    except:
-        pass
+    if price > high:
+        return "sell"
+
+    if price < low:
+        return "buy"
+
     return None
 
-# =========================
-# 🚀 ENTRY
-# =========================
-def enter(symbol, side, size):
-    exchange.create_order(
-        symbol=symbol,
-        type="market",
-        side=side,
-        amount=size,
-        params={"tdMode": "isolated"}
-    )
-    print(f"🚀 ENTRY {side} {symbol}")
+def sniper_entry(symbol, side, balance, price):
+    size = max(0.01, balance * 0.03 / price)
 
-# =========================
-# 🎯 GESTIÓN
-# =========================
-def manage(symbol, pos, atr, market_type):
-    entry = float(pos['entryPrice'])
-    size = float(pos['contracts'])
-    side = pos['side']
-    mark = float(pos['markPrice'])
-
-    pnl = (mark - entry) * size if side == "long" else (entry - mark) * size
-    exit_side = "sell" if side == "long" else "buy"
-
-    if market_type == "trend":
-        target = atr * size * 2.5
-    elif market_type == "normal":
-        target = atr * size * 1.5
-    else:
-        target = atr * size * 0.8
-
-    print(f"💰 PnL: {pnl:.2f} | Target: {target:.2f} | Mode: {market_type}")
-
-    if pnl >= target:
+    try:
         exchange.create_order(
             symbol=symbol,
             type="market",
-            side=exit_side,
+            side=side,
             amount=size,
             params={"tdMode": "isolated"}
         )
-        print("💵 PROFIT CERRADO")
+        print(f"🎯 SNIPER {side.upper()}")
+    except Exception as e:
+        print(e)
 
 # =========================
-# 🛑 STOP GLOBAL INTELIGENTE
+# RIESGO
 # =========================
 def risk_control(balance):
-    global start_balance, stop_mode
+    global start_balance
 
     if start_balance is None:
         start_balance = balance
 
-    drawdown = (start_balance - balance) / start_balance
+    dd = (start_balance - balance) / start_balance
 
-    if drawdown >= MAX_DRAWDOWN:
-        print("🛑 STOP GLOBAL ACTIVADO")
-        stop_mode = True
+    if dd >= MAX_DRAWDOWN:
+        print("🛑 STOP GLOBAL")
         return False
 
     return True
 
-def recovery_mode():
-    print("🧠 Evaluando reentrada...")
-
-    for s in SYMBOLS:
-        df = get_data(s)
-
-        atr = df['atr'].iloc[-1]
-        price = df['close'].iloc[-1]
-        momentum = abs(df['momentum'].iloc[-1])
-        volume = df['volume'].iloc[-1]
-        vol_avg = df['vol_avg'].iloc[-1]
-
-        if momentum > 0.002 and volume > vol_avg and (atr / price) > 0.003:
-            print(f"✅ Mercado recuperado en {s}")
-            return True
-
-    print("⏸ Aún no hay condiciones")
-    return False
-
 # =========================
-# 🔁 LOOP
+# LOOP
 # =========================
 def run():
-    global last_trade_time, stop_mode, start_balance
-
-    print("🔥 BOT FINAL NIVEL PRO ACTIVADO")
+    print("🔥 BOT HÍBRIDO PRO FINAL")
 
     while True:
         try:
             balance = exchange.fetch_balance()['USDT']['free']
 
-            # 🛑 STOP INTELIGENTE
-            if stop_mode:
-                print("🛑 BOT EN MODO STOP")
-
-                if recovery_mode():
-                    print("🚀 REACTIVANDO BOT")
-                    stop_mode = False
-                    start_balance = balance
-                else:
-                    time.sleep(30)
-                    continue
-
-            elif not risk_control(balance):
-                continue
+            if not risk_control(balance):
+                break
 
             symbol = choose_symbol()
-
-            if symbol is None:
-                time.sleep(20)
-                continue
-
             df = get_data(symbol)
-            market_type = detect_market(df)
-            signal = get_signal(df)
-
-            if market_type == "dead" or signal is None:
-                print("⏸ Mercado no óptimo")
-                time.sleep(20)
-                continue
 
             price = df['close'].iloc[-1]
             atr = df['atr'].iloc[-1]
 
-            risk, lev = get_risk_and_lev(market_type, atr, price)
+            lev = dynamic_leverage(atr, price)
 
-            pos = get_position(symbol)
+            cancel_all(symbol)
+            set_leverage(symbol, lev)
 
-            if time.time() - last_trade_time < COOLDOWN:
-                time.sleep(10)
+            mkt = market_type(df)
+
+            print(f"\n🎯 {symbol} | {mkt} | Lev x{lev}")
+
+            # 🔥 SNIPER PRIORIDAD
+            signal = sniper_signal(df)
+
+            if signal:
+                sniper_entry(symbol, signal, balance, price)
+                time.sleep(20)
                 continue
 
-            if not pos:
-                set_leverage(symbol, lev)
-                size = size_calc(symbol, balance, price, risk, lev)
-                enter(symbol, signal, size)
-                last_trade_time = time.time()
-            else:
-                manage(symbol, pos, atr, market_type)
+            # 🔥 GRID
+            if mkt == "range":
+                grid, size = create_grid(df, balance)
+                place_grid(symbol, grid, size)
 
-            time.sleep(15)
+            time.sleep(20)
 
         except Exception as e:
             print(f"❌ ERROR: {e}")
             time.sleep(10)
 
-# =========================
-# ▶️ START
-# =========================
 if __name__ == "__main__":
     run()
