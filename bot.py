@@ -19,12 +19,12 @@ SYMBOLS = [
     "XRP/USDT:USDT"
 ]
 
-RISK_BASE = 0.05
 MAX_DRAWDOWN = 0.06
 COOLDOWN = 30
 
 start_balance = None
 last_trade_time = 0
+stop_mode = False
 
 # =========================
 # 🔌 OKX
@@ -101,7 +101,6 @@ def choose_symbol():
         volume = df['volume'].iloc[-1]
         vol_avg = df['vol_avg'].iloc[-1]
 
-        # filtro mínimo
         if volume < vol_avg:
             continue
 
@@ -125,8 +124,6 @@ def choose_symbol():
 # ⚙️ RISK + LEVERAGE
 # =========================
 def get_risk_and_lev(market_type, atr, price):
-    vol = atr / price
-
     if market_type == "trend":
         return 0.08, 10
     elif market_type == "normal":
@@ -211,10 +208,10 @@ def manage(symbol, pos, atr, market_type):
         print("💵 PROFIT CERRADO")
 
 # =========================
-# 🛑 RIESGO GLOBAL
+# 🛑 STOP GLOBAL INTELIGENTE
 # =========================
 def risk_control(balance):
-    global start_balance
+    global start_balance, stop_mode
 
     if start_balance is None:
         start_balance = balance
@@ -223,24 +220,56 @@ def risk_control(balance):
 
     if drawdown >= MAX_DRAWDOWN:
         print("🛑 STOP GLOBAL ACTIVADO")
+        stop_mode = True
         return False
 
     return True
+
+def recovery_mode():
+    print("🧠 Evaluando reentrada...")
+
+    for s in SYMBOLS:
+        df = get_data(s)
+
+        atr = df['atr'].iloc[-1]
+        price = df['close'].iloc[-1]
+        momentum = abs(df['momentum'].iloc[-1])
+        volume = df['volume'].iloc[-1]
+        vol_avg = df['vol_avg'].iloc[-1]
+
+        if momentum > 0.002 and volume > vol_avg and (atr / price) > 0.003:
+            print(f"✅ Mercado recuperado en {s}")
+            return True
+
+    print("⏸ Aún no hay condiciones")
+    return False
 
 # =========================
 # 🔁 LOOP
 # =========================
 def run():
-    global last_trade_time
+    global last_trade_time, stop_mode, start_balance
 
-    print("🔥 BOT PRO ADAPTATIVO + MULTI-ACTIVOS")
+    print("🔥 BOT FINAL NIVEL PRO ACTIVADO")
 
     while True:
         try:
             balance = exchange.fetch_balance()['USDT']['free']
 
-            if not risk_control(balance):
-                break
+            # 🛑 STOP INTELIGENTE
+            if stop_mode:
+                print("🛑 BOT EN MODO STOP")
+
+                if recovery_mode():
+                    print("🚀 REACTIVANDO BOT")
+                    stop_mode = False
+                    start_balance = balance
+                else:
+                    time.sleep(30)
+                    continue
+
+            elif not risk_control(balance):
+                continue
 
             symbol = choose_symbol()
 
