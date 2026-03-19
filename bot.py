@@ -18,6 +18,11 @@ COOLDOWN = 8
 martingale_level = 1
 MAX_MARTINGALE = 3
 
+# control
+loss_streak = 0
+MAX_LOSS_STREAK = 3
+PAUSE_TIME = 120  # segundos
+
 start_balance = None
 
 # =========================
@@ -48,27 +53,45 @@ def get_data():
     return df
 
 # =========================
-# LEVERAGE DINÁMICO
+# FILTRO MERCADO
+# =========================
+def market_ok(df):
+    atr = df['atr'].iloc[-1]
+    price = df['close'].iloc[-1]
+
+    vol = atr / price
+
+    if vol < 0.0015:
+        print("⏸ Mercado muerto")
+        return False
+
+    return True
+
+# =========================
+# LEVERAGE DINÁMICO (MAX 3)
 # =========================
 def dynamic_leverage(atr, price):
     vol = atr / price
 
     if vol < 0.002:
-        return 12
+        return 3
     elif vol < 0.005:
-        return 10
+        return 2
     else:
-        return 7
+        return 1
 
 def set_leverage(lev):
-    exchange.set_leverage(
-        lev,
-        exchange.market(SYMBOL)['id'],
-        params={"mgnMode": "isolated"}
-    )
+    try:
+        exchange.set_leverage(
+            lev,
+            exchange.market(SYMBOL)['id'],
+            params={"mgnMode": "isolated"}
+        )
+    except:
+        pass
 
 # =========================
-# MARTINGALA SIZE
+# SIZE
 # =========================
 def size_calc(balance, price):
     global martingale_level
@@ -89,12 +112,12 @@ def size_calc(balance, price):
     return float(exchange.amount_to_precision(SYMBOL, size))
 
 # =========================
-# POSICIONES
+# POSICIÓN
 # =========================
 def get_position():
     try:
-        pos = exchange.fetch_positions([SYMBOL])
-        for p in pos:
+        positions = exchange.fetch_positions([SYMBOL])
+        for p in positions:
             if float(p['contracts']) > 0:
                 return p
     except:
@@ -102,10 +125,10 @@ def get_position():
     return None
 
 # =========================
-# GESTIÓN
+# GESTIÓN PRO
 # =========================
 def manage_position(pos):
-    global martingale_level
+    global martingale_level, loss_streak
 
     entry = float(pos['entryPrice'])
     mark = float(pos['markPrice'])
@@ -126,23 +149,31 @@ def manage_position(pos):
             params={"tdMode": "isolated"}
         )
 
-        print(f"💰 PROFIT {pnl:.2f} | RESET MARTINGALA")
+        print(f"💰 PROFIT {pnl:.2f}")
         martingale_level = 1
+        loss_streak = 0
 
     # ❌ PÉRDIDA
     elif pnl < -1:
+        loss_streak += 1
+
         if martingale_level < MAX_MARTINGALE:
             martingale_level += 1
-            print(f"⚠️ Martingala nivel {martingale_level}")
         else:
-            print("🛑 MAX MARTINGALA → RESET")
             martingale_level = 1
 
+        print(f"⚠️ Loss streak: {loss_streak}")
+
 # =========================
-# ENTRY SIMPLE
+# SEÑAL MEJORADA
 # =========================
 def signal(df):
     last = df.iloc[-1]
+
+    # evitar ruido
+    if abs(last['ema20'] - last['ema50']) < last['atr'] * 0.3:
+        return None
+
     return "buy" if last['ema20'] > last['ema50'] else "sell"
 
 # =========================
@@ -166,9 +197,9 @@ def risk_control(balance):
 # LOOP
 # =========================
 def run():
-    global martingale_level
+    global loss_streak
 
-    print("🔥 BOT MARTINGALA DINÁMICA ACTIVADO")
+    print("🔥 BOT FINAL REAL ACTIVADO")
 
     while True:
         try:
@@ -178,6 +209,16 @@ def run():
                 break
 
             df = get_data()
+
+            if not market_ok(df):
+                time.sleep(20)
+                continue
+
+            if loss_streak >= MAX_LOSS_STREAK:
+                print("🛑 DEMASIADAS PÉRDIDAS → PAUSA")
+                time.sleep(PAUSE_TIME)
+                loss_streak = 0
+                continue
 
             price = df['close'].iloc[-1]
             atr = df['atr'].iloc[-1]
@@ -191,6 +232,11 @@ def run():
                 manage_position(pos)
             else:
                 side = signal(df)
+
+                if side is None:
+                    time.sleep(10)
+                    continue
+
                 size = size_calc(balance, price)
 
                 exchange.create_order(
@@ -201,7 +247,7 @@ def run():
                     params={"tdMode": "isolated"}
                 )
 
-                print(f"🚀 ENTRY {side} | Nivel {martingale_level}")
+                print(f"🚀 ENTRY {side}")
 
             time.sleep(COOLDOWN)
 
