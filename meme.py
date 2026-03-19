@@ -6,12 +6,14 @@ import pandas as pd
 # CONFIG
 # =========================
 API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
-API_SECRET = DD0B0C2024162F50F4267C1D59C4AC81"
+API_SECRET = "DD0B0C2024162F50F4267C1D59C4AC81"
 PASSPHRASE = "WXcv8089@"
 
+MAX_TRADES = 2
 COOLDOWN = 5
-TRAILING_TRIGGER = 0.3  # USDT
-TRAILING_GAP = 0.2
+
+active_trades = {}
+highest_pnl = {}
 
 # =========================
 # OKX
@@ -30,75 +32,115 @@ exchange = ccxt.okx({
 # =========================
 # DATA
 # =========================
-def get_data(symbol):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=50)
+def get_df(symbol, tf):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
 
-    df['momentum'] = df['close'].pct_change(2)
-    df['vol_avg'] = df['volume'].rolling(10).mean()
+    df['ema20'] = df['close'].ewm(span=20).mean()
+    df['ema50'] = df['close'].ewm(span=50).mean()
+    df['momentum'] = df['close'].pct_change(3)
 
     return df
 
 # =========================
-# DETECTOR ULTRA PUMP
+# SCANNER TOP
 # =========================
-def is_ultra_pump(df):
-    momentum = df['momentum'].iloc[-1]
-    volume = df['volume'].iloc[-1]
-    vol_avg = df['vol_avg'].iloc[-1]
-
-    # 🔥 condiciones fuertes
-    if momentum > 0.015 and volume > vol_avg * 2:
-        return True
-
-    return False
-
-# =========================
-# ANTI FAKE
-# =========================
-def not_late(df):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # 🔥 evita entrar en pico
-    if last['close'] > prev['close'] * 1.02:
-        return False
-
-    return True
-
-# =========================
-# SCANNER
-# =========================
-def find_token():
+def scan_top():
     markets = exchange.load_markets()
+    ranking = []
 
-    best = None
-    best_score = 0
-
-    for s in markets:
+    for s in list(markets)[:30]:
         if ":USDT" not in s:
             continue
 
         try:
-            df = get_data(s)
+            df = get_df(s, '1h')
+            score = abs(df['momentum'].iloc[-1])
 
-            if not is_ultra_pump(df):
-                continue
-
-            if not not_late(df):
-                continue
-
-            score = df['momentum'].iloc[-1]
-
-            if score > best_score:
-                best_score = score
-                best = s
-
+            ranking.append((s, score))
         except:
             continue
 
-    print(f"🎯 ULTRA TOKEN: {best}")
-    return best
+    ranking.sort(key=lambda x: x[1], reverse=True)
+
+    return [x[0] for x in ranking[:5]]
+
+# =========================
+# FILTRO FUERTE
+# =========================
+def strong_market(df):
+    return abs(df['momentum'].iloc[-1]) > 0.002
+
+# =========================
+# SEÑALES
+# =========================
+def trend(df):
+    last = df.iloc[-1]
+    return "buy" if last['ema20'] > last['ema50'] else "sell"
+
+def confirm(df, direction):
+    last = df.iloc[-1]
+    return (direction == "buy" and last['ema20'] > last['ema50']) or \
+           (direction == "sell" and last['ema20'] < last['ema50'])
+
+def sniper(df, direction):
+    momentum = df['momentum'].iloc[-1]
+    return (direction == "buy" and momentum > 0.004) or \
+           (direction == "sell" and momentum < -0.004)
+
+# =========================
+# ENTRY
+# =========================
+def enter(symbol, balance, price, side):
+    size = balance * 0.03 / price
+    size = max(0.01, size)
+
+    size = float(exchange.amount_to_precision(symbol, size))
+
+    exchange.create_order(
+        symbol=symbol,
+        type="market",
+        side=side,
+        amount=size,
+        params={"tdMode": "isolated"}
+    )
+
+    active_trades[symbol] = side
+    highest_pnl[symbol] = 0
+
+    print(f"🚀 ENTRY {symbol} {side}")
+
+# =========================
+# TRAILING PRO
+# =========================
+def manage(symbol, pos):
+    entry = float(pos['entryPrice'])
+    mark = float(pos['markPrice'])
+    size = float(pos['contracts'])
+    side = pos['side']
+
+    pnl = (mark - entry) * size if side == "long" else (entry - mark) * size
+
+    if pnl > highest_pnl[symbol]:
+        highest_pnl[symbol] = pnl
+
+    # 🔥 trailing dinámico
+    if highest_pnl[symbol] > 0.3:
+        if pnl < highest_pnl[symbol] - 0.2:
+            exit_side = "sell" if side == "long" else "buy"
+
+            exchange.create_order(
+                symbol=symbol,
+                type="market",
+                side=exit_side,
+                amount=size,
+                params={"tdMode": "isolated"}
+            )
+
+            print(f"💰 TRAILING EXIT {symbol} {pnl:.2f}")
+
+            del active_trades[symbol]
+            del highest_pnl[symbol]
 
 # =========================
 # POSICIÓN
@@ -114,91 +156,53 @@ def get_position(symbol):
     return None
 
 # =========================
-# ENTRY
-# =========================
-def enter(symbol, balance, price):
-    size = balance * 0.04 / price
-
-    if size < 0.01:
-        size = 0.01
-
-    size = float(exchange.amount_to_precision(symbol, size))
-
-    exchange.create_order(
-        symbol=symbol,
-        type="market",
-        side="buy",
-        amount=size,
-        params={"tdMode": "isolated"}
-    )
-
-    print(f"🚀 ULTRA ENTRY {symbol}")
-
-# =========================
-# TRAILING STOP
-# =========================
-highest_pnl = 0
-
-def manage(symbol, pos):
-    global highest_pnl
-
-    entry = float(pos['entryPrice'])
-    mark = float(pos['markPrice'])
-    size = float(pos['contracts'])
-
-    pnl = (mark - entry) * size
-
-    if pnl > highest_pnl:
-        highest_pnl = pnl
-
-    # 🔥 activar trailing
-    if highest_pnl > TRAILING_TRIGGER:
-
-        if pnl < highest_pnl - TRAILING_GAP:
-            exchange.create_order(
-                symbol=symbol,
-                type="market",
-                side="sell",
-                amount=size,
-                params={"tdMode": "isolated"}
-            )
-
-            print(f"💰 TRAILING EXIT {pnl:.2f}")
-            highest_pnl = 0
-
-# =========================
 # LOOP
 # =========================
 def run():
-    print("🔥 ULTRA SNIPER ACTIVADO")
-
-    current = None
+    print("🔥 MODO BESTIA FINAL ACTIVADO")
 
     while True:
         try:
             balance = exchange.fetch_balance()['USDT']['free']
 
-            if current:
-                pos = get_position(current)
+            # 🔥 gestionar trades activos
+            for symbol in list(active_trades.keys()):
+                pos = get_position(symbol)
 
                 if pos:
-                    manage(current, pos)
-                    time.sleep(2)
-                    continue
+                    manage(symbol, pos)
                 else:
-                    current = None
+                    del active_trades[symbol]
 
-            symbol = find_token()
-
-            if not symbol:
-                time.sleep(5)
+            if len(active_trades) >= MAX_TRADES:
+                time.sleep(2)
                 continue
 
-            df = get_data(symbol)
-            price = df['close'].iloc[-1]
+            # 🔥 buscar oportunidades
+            for symbol in scan_top():
 
-            enter(symbol, balance, price)
-            current = symbol
+                if symbol in active_trades:
+                    continue
+
+                df1h = get_df(symbol, '1h')
+
+                if not strong_market(df1h):
+                    continue
+
+                direction = trend(df1h)
+
+                df5m = get_df(symbol, '5m')
+                if not confirm(df5m, direction):
+                    continue
+
+                df1m = get_df(symbol, '1m')
+                if not sniper(df1m, direction):
+                    continue
+
+                price = df1m['close'].iloc[-1]
+
+                enter(symbol, balance, price, direction)
+                break
 
             time.sleep(COOLDOWN)
 
