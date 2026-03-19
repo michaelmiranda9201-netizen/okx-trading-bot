@@ -9,19 +9,18 @@ API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
 API_SECRET = "DD0B0C2024162F50F4267C1D59C4AC81"
 PASSPHRASE = "WXcv8089@"
 
-SYMBOL = "BTC/USDT:USDT"
-
 MAX_DRAWDOWN = 0.1
 COOLDOWN = 8
+
+TOP_SYMBOLS = 10
 
 # martingala
 martingale_level = 1
 MAX_MARTINGALE = 3
 
-# control
 loss_streak = 0
 MAX_LOSS_STREAK = 3
-PAUSE_TIME = 120  # segundos
+PAUSE_TIME = 120
 
 start_balance = None
 
@@ -40,17 +39,56 @@ exchange = ccxt.okx({
 })
 
 # =========================
-# DATA
+# SCANNER GLOBAL
 # =========================
-def get_data():
-    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=100)
+def get_symbols():
+    markets = exchange.load_markets()
+    return [s for s in markets if ":USDT" in s]
+
+def get_data(symbol, tf='1m'):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
 
     df['ema20'] = df['close'].ewm(span=20).mean()
     df['ema50'] = df['close'].ewm(span=50).mean()
     df['atr'] = (df['high'] - df['low']).rolling(14).mean()
+    df['momentum'] = df['close'].pct_change(3)
 
     return df
+
+def scan_market():
+    symbols = get_symbols()
+    ranking = []
+
+    for s in symbols[:30]:
+        try:
+            df = get_data(s)
+
+            atr = df['atr'].iloc[-1]
+            price = df['close'].iloc[-1]
+            momentum = abs(df['momentum'].iloc[-1])
+            volume = df['volume'].iloc[-1]
+
+            score = (atr / price) * 2 + momentum + (volume)
+
+            ranking.append((s, score))
+
+        except:
+            continue
+
+    ranking.sort(key=lambda x: x[1], reverse=True)
+
+    return [x[0] for x in ranking[:TOP_SYMBOLS]]
+
+def choose_symbol():
+    top = scan_market()
+
+    if not top:
+        return None
+
+    best = top[0]
+    print(f"🎯 Mejor activo: {best}")
+    return best
 
 # =========================
 # FILTRO MERCADO
@@ -59,16 +97,10 @@ def market_ok(df):
     atr = df['atr'].iloc[-1]
     price = df['close'].iloc[-1]
 
-    vol = atr / price
-
-    if vol < 0.0015:
-        print("⏸ Mercado muerto")
-        return False
-
-    return True
+    return (atr / price) > 0.0015
 
 # =========================
-# LEVERAGE DINÁMICO (MAX 3)
+# LEVERAGE
 # =========================
 def dynamic_leverage(atr, price):
     vol = atr / price
@@ -80,11 +112,11 @@ def dynamic_leverage(atr, price):
     else:
         return 1
 
-def set_leverage(lev):
+def set_leverage(symbol, lev):
     try:
         exchange.set_leverage(
             lev,
-            exchange.market(SYMBOL)['id'],
+            exchange.market(symbol)['id'],
             params={"mgnMode": "isolated"}
         )
     except:
@@ -93,30 +125,26 @@ def set_leverage(lev):
 # =========================
 # SIZE
 # =========================
-def size_calc(balance, price):
+def size_calc(symbol, balance, price):
     global martingale_level
 
     base = balance * 0.05 / price
 
-    multiplier = {
-        1: 1,
-        2: 1.5,
-        3: 2
-    }
+    multiplier = {1:1, 2:1.5, 3:2}
 
     size = base * multiplier[martingale_level]
 
     if size < 0.01:
         size = 0.01
 
-    return float(exchange.amount_to_precision(SYMBOL, size))
+    return float(exchange.amount_to_precision(symbol, size))
 
 # =========================
 # POSICIÓN
 # =========================
-def get_position():
+def get_position(symbol):
     try:
-        positions = exchange.fetch_positions([SYMBOL])
+        positions = exchange.fetch_positions([symbol])
         for p in positions:
             if float(p['contracts']) > 0:
                 return p
@@ -125,9 +153,9 @@ def get_position():
     return None
 
 # =========================
-# GESTIÓN PRO
+# GESTIÓN
 # =========================
-def manage_position(pos):
+def manage_position(symbol, pos):
     global martingale_level, loss_streak
 
     entry = float(pos['entryPrice'])
@@ -136,13 +164,12 @@ def manage_position(pos):
     side = pos['side']
 
     pnl = (mark - entry) * size if side == "long" else (entry - mark) * size
-
     exit_side = "sell" if side == "long" else "buy"
 
-    # 💰 PROFIT
+    # 🔥 cierre inmediato
     if pnl > 0:
         exchange.create_order(
-            symbol=SYMBOL,
+            symbol=symbol,
             type="market",
             side=exit_side,
             amount=size,
@@ -153,7 +180,6 @@ def manage_position(pos):
         martingale_level = 1
         loss_streak = 0
 
-    # ❌ PÉRDIDA
     elif pnl < -1:
         loss_streak += 1
 
@@ -162,15 +188,12 @@ def manage_position(pos):
         else:
             martingale_level = 1
 
-        print(f"⚠️ Loss streak: {loss_streak}")
-
 # =========================
-# SEÑAL MEJORADA
+# SEÑAL
 # =========================
 def signal(df):
     last = df.iloc[-1]
 
-    # evitar ruido
     if abs(last['ema20'] - last['ema50']) < last['atr'] * 0.3:
         return None
 
@@ -187,11 +210,7 @@ def risk_control(balance):
 
     dd = (start_balance - balance) / start_balance
 
-    if dd >= MAX_DRAWDOWN:
-        print("🛑 STOP GLOBAL")
-        return False
-
-    return True
+    return dd < MAX_DRAWDOWN
 
 # =========================
 # LOOP
@@ -199,37 +218,45 @@ def risk_control(balance):
 def run():
     global loss_streak
 
-    print("🔥 BOT FINAL REAL ACTIVADO")
+    print("🔥 BOT SUPREMO ACTIVADO")
 
     while True:
         try:
             balance = exchange.fetch_balance()['USDT']['free']
 
             if not risk_control(balance):
+                print("🛑 STOP GLOBAL")
                 break
 
-            df = get_data()
+            if loss_streak >= MAX_LOSS_STREAK:
+                print("🛑 PAUSA POR PÉRDIDAS")
+                time.sleep(PAUSE_TIME)
+                loss_streak = 0
+                continue
 
-            if not market_ok(df):
+            symbol = choose_symbol()
+
+            if symbol is None:
                 time.sleep(20)
                 continue
 
-            if loss_streak >= MAX_LOSS_STREAK:
-                print("🛑 DEMASIADAS PÉRDIDAS → PAUSA")
-                time.sleep(PAUSE_TIME)
-                loss_streak = 0
+            df = get_data(symbol)
+
+            if not market_ok(df):
+                print("⏸ Mercado no válido")
+                time.sleep(15)
                 continue
 
             price = df['close'].iloc[-1]
             atr = df['atr'].iloc[-1]
 
             lev = dynamic_leverage(atr, price)
-            set_leverage(lev)
+            set_leverage(symbol, lev)
 
-            pos = get_position()
+            pos = get_position(symbol)
 
             if pos:
-                manage_position(pos)
+                manage_position(symbol, pos)
             else:
                 side = signal(df)
 
@@ -237,17 +264,17 @@ def run():
                     time.sleep(10)
                     continue
 
-                size = size_calc(balance, price)
+                size = size_calc(symbol, balance, price)
 
                 exchange.create_order(
-                    symbol=SYMBOL,
+                    symbol=symbol,
                     type="market",
                     side=side,
                     amount=size,
                     params={"tdMode": "isolated"}
                 )
 
-                print(f"🚀 ENTRY {side}")
+                print(f"🚀 ENTRY {symbol} {side}")
 
             time.sleep(COOLDOWN)
 
