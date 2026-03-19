@@ -9,8 +9,14 @@ API_KEY = "db75d70b-f577-40e5-b06c-60b9c87584a7"
 API_SECRET = "DD0B0C2024162F50F4267C1D59C4AC81"
 PASSPHRASE = "WXcv8089@"
 
-MAX_DRAWDOWN = 0.06
-GRID_LEVELS = 2  # 🔥 reducido para evitar error
+SYMBOL = "BTC/USDT:USDT"
+
+MAX_DRAWDOWN = 0.1
+COOLDOWN = 8
+
+# martingala
+martingale_level = 1
+MAX_MARTINGALE = 3
 
 start_balance = None
 
@@ -29,38 +35,10 @@ exchange = ccxt.okx({
 })
 
 # =========================
-# BALANCE SEGURO
-# =========================
-def get_safe_balance():
-    balance = exchange.fetch_balance()['USDT']['free']
-    return balance * 0.3  # 🔥 solo usar 30%
-
-# =========================
-# TIMEFRAME DINÁMICO
-# =========================
-def choose_timeframe(atr, price):
-    vol = atr / price
-
-    if vol < 0.002:
-        return '1m'
-    elif vol < 0.005:
-        return '3m'
-    else:
-        return '5m'
-
-# =========================
 # DATA
 # =========================
-def get_data(symbol):
-    base = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=50)
-    df_base = pd.DataFrame(base, columns=['time','open','high','low','close','volume'])
-
-    atr = (df_base['high'] - df_base['low']).rolling(14).mean().iloc[-1]
-    price = df_base['close'].iloc[-1]
-
-    tf = choose_timeframe(atr, price)
-
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
+def get_data():
+    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=100)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
 
     df['ema20'] = df['close'].ewm(span=20).mean()
@@ -76,77 +54,96 @@ def dynamic_leverage(atr, price):
     vol = atr / price
 
     if vol < 0.002:
-        return 10
+        return 12
     elif vol < 0.005:
-        return 7
+        return 10
     else:
-        return 5
+        return 7
 
-def set_leverage(symbol, lev):
-    try:
-        exchange.set_leverage(
-            lev,
-            exchange.market(symbol)['id'],
-            params={"mgnMode": "isolated"}
-        )
-    except:
-        pass
+def set_leverage(lev):
+    exchange.set_leverage(
+        lev,
+        exchange.market(SYMBOL)['id'],
+        params={"mgnMode": "isolated"}
+    )
 
 # =========================
-# SIZE SEGURO
+# MARTINGALA SIZE
 # =========================
-def calculate_size(symbol, balance, price, leverage):
-    usable = balance * 0.5
-    position_value = usable * leverage
+def size_calc(balance, price):
+    global martingale_level
 
-    size = position_value / price
+    base = balance * 0.05 / price
+
+    multiplier = {
+        1: 1,
+        2: 1.5,
+        3: 2
+    }
+
+    size = base * multiplier[martingale_level]
 
     if size < 0.01:
         size = 0.01
 
-    return float(exchange.amount_to_precision(symbol, size))
+    return float(exchange.amount_to_precision(SYMBOL, size))
 
 # =========================
-# SNIPER
+# POSICIONES
 # =========================
-def sniper_signal(df):
-    high = df['high'].rolling(20).max().iloc[-1]
-    low = df['low'].rolling(20).min().iloc[-1]
-    price = df['close'].iloc[-1]
-
-    if price > high:
-        return "sell"
-    if price < low:
-        return "buy"
+def get_position():
+    try:
+        pos = exchange.fetch_positions([SYMBOL])
+        for p in pos:
+            if float(p['contracts']) > 0:
+                return p
+    except:
+        pass
     return None
 
 # =========================
-# GRID
+# GESTIÓN
 # =========================
-def create_grid(df, balance):
-    price = df['close'].iloc[-1]
-    atr = df['atr'].iloc[-1]
+def manage_position(pos):
+    global martingale_level
 
-    spacing = atr * 0.4
-    size = max(0.01, balance * 0.01 / price)
+    entry = float(pos['entryPrice'])
+    mark = float(pos['markPrice'])
+    size = float(pos['contracts'])
+    side = pos['side']
 
-    orders = []
+    pnl = (mark - entry) * size if side == "long" else (entry - mark) * size
 
-    for i in range(1, GRID_LEVELS + 1):
-        orders.append(("buy", price - spacing * i))
-        orders.append(("sell", price + spacing * i))
+    exit_side = "sell" if side == "long" else "buy"
 
-    return orders, size
+    # 💰 PROFIT
+    if pnl > 0:
+        exchange.create_order(
+            symbol=SYMBOL,
+            type="market",
+            side=exit_side,
+            amount=size,
+            params={"tdMode": "isolated"}
+        )
+
+        print(f"💰 PROFIT {pnl:.2f} | RESET MARTINGALA")
+        martingale_level = 1
+
+    # ❌ PÉRDIDA
+    elif pnl < -1:
+        if martingale_level < MAX_MARTINGALE:
+            martingale_level += 1
+            print(f"⚠️ Martingala nivel {martingale_level}")
+        else:
+            print("🛑 MAX MARTINGALA → RESET")
+            martingale_level = 1
 
 # =========================
-# LIMPIAR
+# ENTRY SIMPLE
 # =========================
-def cancel_orders(symbol):
-    try:
-        for o in exchange.fetch_open_orders(symbol):
-            exchange.cancel_order(o['id'], symbol)
-    except:
-        pass
+def signal(df):
+    last = df.iloc[-1]
+    return "buy" if last['ema20'] > last['ema50'] else "sell"
 
 # =========================
 # RIESGO
@@ -169,75 +166,48 @@ def risk_control(balance):
 # LOOP
 # =========================
 def run():
-    print("🔥 BOT CORREGIDO ACTIVADO")
+    global martingale_level
 
-    SYMBOL = "BTC/USDT:USDT"  # 🔥 empezar simple
+    print("🔥 BOT MARTINGALA DINÁMICA ACTIVADO")
 
     while True:
         try:
-            balance_total = exchange.fetch_balance()['USDT']['free']
+            balance = exchange.fetch_balance()['USDT']['free']
 
-            if balance_total < 5:
-                print("⚠️ Balance bajo")
-                time.sleep(30)
-                continue
-
-            if not risk_control(balance_total):
+            if not risk_control(balance):
                 break
 
-            balance = get_safe_balance()
-
-            df = get_data(SYMBOL)
+            df = get_data()
 
             price = df['close'].iloc[-1]
             atr = df['atr'].iloc[-1]
 
             lev = dynamic_leverage(atr, price)
+            set_leverage(lev)
 
-            cancel_orders(SYMBOL)
-            set_leverage(SYMBOL, lev)
+            pos = get_position()
 
-            print(f"\n🎯 {SYMBOL} | Lev x{lev}")
-
-            # SNIPER
-            signal = sniper_signal(df)
-
-            if signal:
-                size = calculate_size(SYMBOL, balance, price, lev)
+            if pos:
+                manage_position(pos)
+            else:
+                side = signal(df)
+                size = size_calc(balance, price)
 
                 exchange.create_order(
                     symbol=SYMBOL,
                     type="market",
-                    side=signal,
-                    amount=size,
-                    params={"tdMode": "isolated"}
-                )
-
-                print(f"🎯 SNIPER {signal}")
-                time.sleep(20)
-                continue
-
-            # GRID
-            grid, size = create_grid(df, balance)
-
-            for side, p in grid:
-                exchange.create_order(
-                    symbol=SYMBOL,
-                    type="limit",
                     side=side,
                     amount=size,
-                    price=p,
                     params={"tdMode": "isolated"}
                 )
 
-            time.sleep(20)
+                print(f"🚀 ENTRY {side} | Nivel {martingale_level}")
+
+            time.sleep(COOLDOWN)
 
         except Exception as e:
             print(f"❌ ERROR: {e}")
-            time.sleep(10)
+            time.sleep(5)
 
-# =========================
-# START
-# =========================
 if __name__ == "__main__":
     run()
