@@ -1,5 +1,3 @@
-README.md
-okxp.py
-requirements.txt
-Procfile
-runtime.txt
+requests==2.31.0
+pandas==2.2.2
+numpy==1.26.4
