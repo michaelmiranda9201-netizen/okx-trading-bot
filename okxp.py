@@ -1,168 +1,144 @@
+import ccxt
+import pandas as pd
+import numpy as np
 import requests
 import time
-import hmac
-import base64
-import json
 import os
-from datetime import datetime
-import pandas as pd
 
+# ========================
+# CONFIG
+# ========================
 API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
-SECRET_KEY = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
+SECRET = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
 PASSPHRASE = os.getenv("WXcv8089@")
 
-BASE_URL = "https://www.okx.com"
+exchange = ccxt.okx({
+    'apiKey': API_KEY,
+    'secret': SECRET,
+    'password': PASSPHRASE,
+    'enableRateLimit': True,
+})
 
-CAPITAL = 50
-RISK = 0.02
-MAX_TRADES = 2
-SCORE_THRESHOLD = 70
-
-def headers(method, path, body=""):
-    ts = datetime.utcnow().isoformat() + "Z"
-    msg = ts + method + path + body
-    sign = base64.b64encode(
-        hmac.new(SECRET_KEY.encode(), msg.encode(), 'sha256').digest()
-    )
-    return {
-        "OK-ACCESS-KEY": API_KEY,
-        "OK-ACCESS-SIGN": sign.decode(),
-        "OK-ACCESS-TIMESTAMP": ts,
-        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
-        "Content-Type": "application/json"
-    }
-
-def get_pairs():
-    url = "/api/v5/public/instruments?instType=SWAP"
-    r = requests.get(BASE_URL + url).json()
-    return [i['instId'] for i in r['data'] if "USDT" in i['instId']]
-
-def candles(symbol, tf):
-    url = f"/api/v5/market/candles?instId={symbol}&bar={tf}&limit=100"
-    r = requests.get(BASE_URL + url).json()
-    df = pd.DataFrame(r['data'],
-        columns=['ts','o','h','l','c','vol','v1','v2','conf'])
-    df = df[::-1]
-    df[['c','h','l']] = df[['c','h','l']].astype(float)
-    return df
-
-def ema(df, n):
-    return df['c'].ewm(span=n).mean()
-
-def atr(df):
-    return (df['h'] - df['l']).rolling(14).mean()
-
-def score_pair(symbol):
+# ========================
+# NEWS FILTER (TradingEconomics)
+# ========================
+def high_impact_news():
     try:
-        d1 = candles(symbol, "1D")
-        h4 = candles(symbol, "4H")
-        h1 = candles(symbol, "1H")
+        url = "https://api.tradingeconomics.com/calendar"
+        r = requests.get(url)
+        data = r.json()
 
-        d1['ema50'], d1['ema200'] = ema(d1,50), ema(d1,200)
-        h4['ema50'], h4['ema200'] = ema(h4,50), ema(h4,200)
-        h1['ema50'], h1['ema200'] = ema(h1,50), ema(h1,200)
-        h1['atr'] = atr(h1)
-
-        score = 0
-
-        if d1['ema50'].iloc[-1] > d1['ema200'].iloc[-1]:
-            score += 30
-            direction = "buy"
-        else:
-            score += 30
-            direction = "sell"
-
-        if direction == "buy" and h4['ema50'].iloc[-1] > h4['ema200'].iloc[-1]:
-            score += 25
-        if direction == "sell" and h4['ema50'].iloc[-1] < h4['ema200'].iloc[-1]:
-            score += 25
-
-        if direction == "buy" and h1['ema50'].iloc[-1] > h1['ema200'].iloc[-1]:
-            score += 20
-        if direction == "sell" and h1['ema50'].iloc[-1] < h1['ema200'].iloc[-1]:
-            score += 20
-
-        atr_val = h1['atr'].iloc[-1]
-        if atr_val > h1['c'].iloc[-1] * 0.002:
-            score += 15
-
-        return {
-            "symbol": symbol,
-            "score": score,
-            "direction": direction,
-            "price": h1['c'].iloc[-1],
-            "atr": atr_val
-        }
+        for event in data:
+            if event['importance'] == 3:
+                return True
+        return False
     except:
-        return None
+        return False
 
-def positions():
-    try:
-        path = "/api/v5/account/positions"
-        r = requests.get(BASE_URL + path, headers=headers("GET", path)).json()
-        return [p for p in r.get('data', []) if float(p.get('pos', 0)) != 0]
-    except:
-        return []
+# ========================
+# INDICADORES
+# ========================
+def ema(df, period):
+    return df['close'].ewm(span=period).mean()
 
-def size(price, sl):
-    risk_amt = CAPITAL * RISK
-    dist = abs(price - sl)
-    return round(risk_amt / dist, 4)
+# ========================
+# SMART MONEY (simplificado)
+# ========================
+def detect_liquidity_sweep(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-def trade(data):
-    price = data['price']
-    atr = data['atr']
+    # Sweep de highs
+    if last['high'] > prev['high'] and last['close'] < prev['high']:
+        return "SELL"
 
-    if data['direction'] == "buy":
-        sl = price - atr * 1.2
-        tp = price + atr * 2.5
+    # Sweep de lows
+    if last['low'] < prev['low'] and last['close'] > prev['low']:
+        return "BUY"
+
+    return None
+
+def detect_fakeout(df):
+    last = df.iloc[-1]
+
+    body = abs(last['close'] - last['open'])
+    wick = last['high'] - last['low']
+
+    if wick > body * 3:
+        return True
+
+    return False
+
+# ========================
+# SCORE
+# ========================
+def calculate_score(df):
+    score = 0
+
+    df['ema50'] = ema(df, 50)
+    df['ema200'] = ema(df, 200)
+
+    if df['ema50'].iloc[-1] > df['ema200'].iloc[-1]:
+        score += 30
     else:
-        sl = price + atr * 1.2
-        tp = price - atr * 2.5
+        score += 30
 
-    sz = size(price, sl)
+    if not detect_fakeout(df):
+        score += 20
 
-    body = json.dumps({
-        "instId": data['symbol'],
-        "tdMode": "isolated",
-        "side": data['direction'],
-        "ordType": "market",
-        "sz": str(sz),
-        "lever": "3"
-    })
+    if df['volume'].iloc[-1] > df['volume'].mean():
+        score += 20
 
-    path = "/api/v5/trade/order"
+    if detect_liquidity_sweep(df):
+        score += 30
 
-    requests.post(BASE_URL + path,
-        headers=headers("POST", path, body),
-        data=body)
+    return score
 
-    print(f"TRADE {data['symbol']} {data['score']}")
+# ========================
+# SCANNER
+# ========================
+def get_pairs():
+    markets = exchange.load_markets()
+    return [s for s in markets if "/USDT" in s]
 
-while True:
-    try:
+# ========================
+# EJECUCIÓN
+# ========================
+def run_bot():
+    while True:
+        print("🔎 Escaneando mercado...")
+
+        if high_impact_news():
+            print("⚠️ Noticias fuertes, no operar")
+            time.sleep(60)
+            continue
+
         pairs = get_pairs()
-        results = []
 
-        print("Escaneando...")
+        for pair in pairs[:20]:  # limit para rendimiento
+            try:
+                ohlcv = exchange.fetch_ohlcv(pair, timeframe='15m', limit=100)
+                df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
 
-        for p in pairs:
-            s = score_pair(p)
-            if s:
-                results.append(s)
-            time.sleep(0.2)
+                score = calculate_score(df)
+                signal = detect_liquidity_sweep(df)
 
-        results = sorted(results, key=lambda x: x['score'], reverse=True)
+                if score >= 70 and signal:
+                    print(f"🔥 {pair} | {signal} | Score: {score}")
 
-        open_pos = len(positions())
+                    # Aquí puedes meter orden real
+                    # place_order(pair, signal)
 
-        for r in results:
-            if r['score'] >= SCORE_THRESHOLD and open_pos < MAX_TRADES:
-                trade(r)
-                open_pos += 1
+            except Exception as e:
+                print(f"Error en {pair}: {e}")
 
-        time.sleep(300)
-
-    except Exception as e:
-        print("Error:", e)
         time.sleep(60)
+
+# ========================
+# START
+# ========================
+if __name__ == "__main__":
+    if not API_KEY:
+        print("⚠️ Configura tus API KEYS")
+    else:
+        run_bot()
