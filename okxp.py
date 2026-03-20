@@ -14,8 +14,6 @@ PASSPHRASE = os.getenv("WXcv8089@")
 BASE_URL = "https://www.okx.com"
 
 MAX_TRADES = 4
-CAPITAL = 50
-RISK = 0.02
 
 # =========================
 # AUTH
@@ -35,20 +33,40 @@ def headers(method, path, body=""):
     }
 
 # =========================
-# DATA
+# PARES
 # =========================
 def get_pairs():
-    r = requests.get(BASE_URL + "/api/v5/public/instruments?instType=SWAP").json()
-    return [i['instId'] for i in r['data'] if "USDT" in i['instId']]
+    try:
+        r = requests.get(BASE_URL + "/api/v5/public/instruments?instType=SWAP").json()
+        return [i['instId'] for i in r.get('data', []) if "USDT" in i['instId']]
+    except:
+        return []
 
+# =========================
+# DATA SEGURA
+# =========================
 def candles(symbol, tf):
-    url = f"/api/v5/market/candles?instId={symbol}&bar={tf}&limit=100"
-    r = requests.get(BASE_URL + url).json()
-    df = pd.DataFrame(r['data'],
-        columns=['ts','o','h','l','c','vol','v1','v2','conf'])
-    df = df[::-1]
-    df[['c','h','l']] = df[['c','h','l']].astype(float)
-    return df
+    try:
+        url = f"/api/v5/market/candles?instId={symbol}&bar={tf}&limit=100"
+        r = requests.get(BASE_URL + url).json()
+
+        if 'data' not in r or len(r['data']) == 0:
+            return None
+
+        df = pd.DataFrame(r['data'],
+            columns=['ts','o','h','l','c','vol','v1','v2','conf'])
+
+        df = df[::-1]
+
+        if df.empty:
+            return None
+
+        df[['c','h','l']] = df[['c','h','l']].astype(float)
+
+        return df
+
+    except:
+        return None
 
 # =========================
 # INDICADORES
@@ -60,11 +78,14 @@ def atr(df):
     return (df['h'] - df['l']).rolling(14).mean()
 
 # =========================
-# TENDENCIA
+# MODO DE MERCADO
 # =========================
 def get_mode(symbol):
     h4 = candles(symbol, "4H")
     h1 = candles(symbol, "1H")
+
+    if h4 is None or h1 is None or len(h4) < 50 or len(h1) < 50:
+        return None
 
     h4['ema50'], h4['ema200'] = ema(h4,50), ema(h4,200)
     h1['ema50'], h1['ema200'] = ema(h1,50), ema(h1,200)
@@ -76,7 +97,7 @@ def get_mode(symbol):
     return "neutral"
 
 # =========================
-# GRID LOGIC
+# GRID DINÁMICO
 # =========================
 def build_grid(price, atr_val, mode):
     grid = []
@@ -131,7 +152,7 @@ def place_order(symbol, side, price):
         print("Error orden:", e)
 
 # =========================
-# SCANNER + GRID
+# RUN PRINCIPAL
 # =========================
 def run():
     pairs = get_pairs()
@@ -143,13 +164,26 @@ def run():
 
         try:
             m5 = candles(symbol, "5M")
-            price = m5['c'].iloc[-1]
-            atr_val = atr(m5).iloc[-1]
 
-            if atr_val is None or atr_val == 0:
+            if m5 is None or len(m5) < 30:
+                continue
+
+            price = m5['c'].iloc[-1]
+
+            atr_series = atr(m5)
+
+            if atr_series is None or len(atr_series) < 20:
+                continue
+
+            atr_val = atr_series.iloc[-1]
+
+            if pd.isna(atr_val) or atr_val == 0:
                 continue
 
             mode = get_mode(symbol)
+
+            if mode is None:
+                continue
 
             grid = build_grid(price, atr_val, mode)
 
@@ -162,6 +196,8 @@ def run():
                     place_order(symbol, "buy", g)
                     place_order(symbol, "sell", g)
 
+            print(f"⚡ {symbol} | Mode: {mode}")
+
             open_pos += 1
             time.sleep(1)
 
@@ -173,9 +209,9 @@ def run():
 # =========================
 while True:
     try:
-        print("⚡ ULTRA SCALPING RUNNING...")
+        print("⚡ ULTRA SCALPING ACTIVO...")
         run()
         time.sleep(180)
     except Exception as e:
-        print("💥 Error:", e)
+        print("💥 Error general:", e)
         time.sleep(60)
