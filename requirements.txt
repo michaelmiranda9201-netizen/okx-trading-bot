@@ -1,4 +1,5 @@
-ccxt
-pandas
-numpy
-requests
+README.md
+okxp.py
+requirements.txt
+Procfile
+runtime.txt
