@@ -1,6 +1,1 @@
-
-requests
-pandas
-numpy
-okx
-ta
+OKX Sniper Bot Railway
