@@ -13,15 +13,12 @@ PASSPHRASE = os.getenv("WXcv8089@")
 
 BASE_URL = "https://www.okx.com"
 
-MAX_TRADES = 4
-MAX_ORDERS_PER_PAIR = 6
-COOLDOWN = 300  # 🔥 más agresivo
+MAX_TRADES = 6
+MAX_ORDERS_PER_PAIR = 10
+COOLDOWN = 120
 
 last_trade_time = {}
 
-# =========================
-# AUTH
-# =========================
 def headers(method, path, body=""):
     ts = datetime.utcnow().isoformat() + "Z"
     msg = ts + method + path + body
@@ -36,9 +33,6 @@ def headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-# =========================
-# DATA
-# =========================
 def candles(symbol, tf):
     try:
         url = f"/api/v5/market/candles?instId={symbol}&bar={tf}&limit=100"
@@ -53,7 +47,6 @@ def candles(symbol, tf):
         df = df[::-1]
         df[['c','h','l']] = df[['c','h','l']].astype(float)
         return df
-
     except:
         return None
 
@@ -64,18 +57,12 @@ def get_pairs():
     except:
         return []
 
-# =========================
-# INDICADORES
-# =========================
 def ema(df, n):
     return df['c'].ewm(span=n).mean()
 
 def atr(df):
     return (df['h'] - df['l']).rolling(14).mean()
 
-# =========================
-# MODO MERCADO
-# =========================
 def get_mode(symbol):
     h4 = candles(symbol, "4H")
     h1 = candles(symbol, "1H")
@@ -92,9 +79,6 @@ def get_mode(symbol):
         return "short"
     return "neutral"
 
-# =========================
-# POSICIONES
-# =========================
 def positions():
     try:
         path = "/api/v5/account/positions"
@@ -103,9 +87,6 @@ def positions():
     except:
         return []
 
-# =========================
-# ORDENES ABIERTAS
-# =========================
 def open_orders(symbol):
     try:
         path = f"/api/v5/trade/orders-pending?instId={symbol}"
@@ -114,43 +95,33 @@ def open_orders(symbol):
     except:
         return []
 
-# =========================
-# GRID + TP/SL
-# =========================
 def build_orders(symbol, price, atr_val, mode):
     orders = []
-    step = atr_val * 0.4  # 🔥 más agresivo
+    step = atr_val * 0.3
 
-    for i in range(1, 4):
+    for i in range(1, 6):  # 🔥 5 niveles
 
         if mode == "long":
             entry = price - step * i
-            sl = entry - atr_val * 1.2
-            tp = entry + atr_val * 2.5
-            side = "buy"
+            sl = entry - atr_val
+            tp = entry + atr_val * 2
+            orders.append(("buy", entry, sl, tp))
 
         elif mode == "short":
             entry = price + step * i
-            sl = entry + atr_val * 1.2
-            tp = entry - atr_val * 2.5
-            side = "sell"
+            sl = entry + atr_val
+            tp = entry - atr_val * 2
+            orders.append(("sell", entry, sl, tp))
 
         else:
-            # 🔥 modo neutral (grid doble)
-            entry_buy = price - step * i
-            entry_sell = price + step * i
+            buy = price - step * i
+            sell = price + step * i
 
-            orders.append(("buy", entry_buy, entry_buy - atr_val, entry_buy + atr_val * 2))
-            orders.append(("sell", entry_sell, entry_sell + atr_val, entry_sell - atr_val * 2))
-            continue
-
-        orders.append((side, entry, sl, tp))
+            orders.append(("buy", buy, buy - atr_val, buy + atr_val * 2))
+            orders.append(("sell", sell, sell + atr_val, sell - atr_val * 2))
 
     return orders
 
-# =========================
-# EJECUTAR ORDEN
-# =========================
 def place_order(symbol, side, px, sl, tp):
     body = json.dumps({
         "instId": symbol,
@@ -171,17 +142,14 @@ def place_order(symbol, side, px, sl, tp):
             headers=headers("POST", path, body),
             data=body)
 
-        print(f"🔥 {symbol} {side} @ {px} | SL {sl} | TP {tp}")
+        print(f"🔥 {symbol} {side} @ {px}")
 
-    except Exception as e:
-        print("Error orden:", e)
+    except:
+        pass
 
-# =========================
-# RUN
-# =========================
 def run():
     pairs = get_pairs()
-    print(f"🔍 Escaneando {len(pairs)} pares...")
+    print(f"🔍 {len(pairs)} pares...")
 
     open_pos = len(positions())
 
@@ -190,7 +158,6 @@ def run():
         if open_pos >= MAX_TRADES:
             return
 
-        # cooldown
         if symbol in last_trade_time:
             if time.time() - last_trade_time[symbol] < COOLDOWN:
                 continue
@@ -210,13 +177,10 @@ def run():
             if pd.isna(atr_val) or atr_val == 0:
                 continue
 
-            # 🔥 MÁS FLEXIBLE
-            if atr_val < price * 0.0003:
+            if atr_val < price * 0.0002:
                 continue
 
             mode = get_mode(symbol)
-            print(f"{symbol} → modo: {mode}")
-
             if mode is None:
                 continue
 
@@ -231,21 +195,17 @@ def run():
             last_trade_time[symbol] = time.time()
             open_pos += 1
 
-            print(f"⚡ {symbol} MODE: {mode}")
+            print(f"⚡ {symbol} {mode}")
 
-            time.sleep(1)
+            time.sleep(0.5)
 
-        except Exception as e:
-            print(f"Error {symbol}:", e)
+        except:
+            continue
 
-# =========================
-# LOOP
-# =========================
 while True:
     try:
-        print("💀 MODO AGRESIVO INTELIGENTE ACTIVO...")
+        print("💀 MODO AGRESIVO PRO ACTIVO...")
         run()
-        time.sleep(180)
-    except Exception as e:
-        print("💥 Error general:", e)
+        time.sleep(120)
+    except:
         time.sleep(60)
