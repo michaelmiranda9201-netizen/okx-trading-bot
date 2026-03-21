@@ -15,7 +15,7 @@ BASE_URL = "https://www.okx.com"
 
 MAX_TRADES = 4
 MAX_ORDERS_PER_PAIR = 6
-COOLDOWN = 600  # segundos
+COOLDOWN = 300  # 🔥 más agresivo
 
 last_trade_time = {}
 
@@ -119,9 +119,10 @@ def open_orders(symbol):
 # =========================
 def build_orders(symbol, price, atr_val, mode):
     orders = []
-    step = atr_val * 0.5
+    step = atr_val * 0.4  # 🔥 más agresivo
 
     for i in range(1, 4):
+
         if mode == "long":
             entry = price - step * i
             sl = entry - atr_val * 1.2
@@ -135,6 +136,12 @@ def build_orders(symbol, price, atr_val, mode):
             side = "sell"
 
         else:
+            # 🔥 modo neutral (grid doble)
+            entry_buy = price - step * i
+            entry_sell = price + step * i
+
+            orders.append(("buy", entry_buy, entry_buy - atr_val, entry_buy + atr_val * 2))
+            orders.append(("sell", entry_sell, entry_sell + atr_val, entry_sell - atr_val * 2))
             continue
 
         orders.append((side, entry, sl, tp))
@@ -174,6 +181,8 @@ def place_order(symbol, side, px, sl, tp):
 # =========================
 def run():
     pairs = get_pairs()
+    print(f"🔍 Escaneando {len(pairs)} pares...")
+
     open_pos = len(positions())
 
     for symbol in pairs:
@@ -201,15 +210,16 @@ def run():
             if pd.isna(atr_val) or atr_val == 0:
                 continue
 
-            # filtro volatilidad mínima
-            if atr_val < price * 0.001:
+            # 🔥 MÁS FLEXIBLE
+            if atr_val < price * 0.0003:
                 continue
 
             mode = get_mode(symbol)
-            if mode not in ["long", "short"]:
+            print(f"{symbol} → modo: {mode}")
+
+            if mode is None:
                 continue
 
-            # evitar duplicados
             if len(open_orders(symbol)) > MAX_ORDERS_PER_PAIR:
                 continue
 
@@ -233,7 +243,7 @@ def run():
 # =========================
 while True:
     try:
-        print("💀 KILLER CONTROL ACTIVO...")
+        print("💀 MODO AGRESIVO INTELIGENTE ACTIVO...")
         run()
         time.sleep(180)
     except Exception as e:
