@@ -1,61 +1,64 @@
 import os
 import time
 import requests
-import pandas as pd
-from okx import Trade, Market
+from okx import Trade
 
 # =============================
-# 🔐 CONFIG API
+# 🔐 API CONFIG
 # =============================
 API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
 SECRET_KEY = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
 PASSPHRASE = os.getenv("WXcv8089@")
 
 if not API_KEY:
-    raise ValueError("❌ API KEYS NO CONFIGURADAS")
+    raise Exception("❌ API KEYS NO CONFIGURADAS")
 
 tradeAPI = Trade.TradeAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, "0")
-marketAPI = Market.MarketAPI()
 
 SYMBOL = "DOGE-USDT-SWAP"
 SIZE = "1"
 
 # =============================
-# 📊 FUNCIONES
+# 📊 PRECIO
 # =============================
+def get_price():
+    try:
+        url = f"https://www.okx.com/api/v5/market/ticker?instId={SYMBOL}"
+        data = requests.get(url).json()
+        return float(data["data"][0]["last"])
+    except:
+        print("❌ Error obteniendo precio")
+        return None
 
-def get_candles():
-    url = f"https://www.okx.com/api/v5/market/candles?instId={SYMBOL}&bar=1m&limit=100"
-    data = requests.get(url).json()
-    
-    df = pd.DataFrame(data["data"])
-    df = df.astype(float)
-    df.columns = ["ts","open","high","low","close","vol","volCcy","volCcyQuote","confirm"]
-    
-    return df[::-1]
+# =============================
+# 🧠 TENDENCIA SIMPLE
+# =============================
+last_prices = []
 
-def calculate_ema(df):
-    df["ema50"] = df["close"].ewm(span=50).mean()
-    df["ema200"] = df["close"].ewm(span=200).mean()
-    return df
+def get_trend(price):
+    last_prices.append(price)
 
-def get_trend(df):
-    ema50 = df["ema50"].iloc[-1]
-    ema200 = df["ema200"].iloc[-1]
+    if len(last_prices) > 10:
+        last_prices.pop(0)
 
-    if ema50 > ema200:
+    if len(last_prices) < 10:
+        return "WAIT"
+
+    avg_old = sum(last_prices[:5]) / 5
+    avg_new = sum(last_prices[5:]) / 5
+
+    if avg_new > avg_old:
         return "UP"
-    elif ema50 < ema200:
+    elif avg_new < avg_old:
         return "DOWN"
     else:
         return "SIDE"
 
 # =============================
-# 🚀 EJECUCIÓN DE ORDEN
+# 🚀 ORDEN
 # =============================
-
 def place_order(side):
-    print(f"🚀 Intentando abrir {side}...")
+    print(f"🚀 Enviando orden {side}...")
 
     try:
         order = tradeAPI.place_order(
@@ -66,48 +69,41 @@ def place_order(side):
             sz=SIZE
         )
 
-        print("📤 RESPUESTA OKX:", order)
+        print("📤 OKX RESPONSE:", order)
 
         if order.get("code") == "0":
             print("✅ ORDEN EJECUTADA")
         else:
-            print("❌ ERROR DE OKX:", order)
+            print("❌ OKX ERROR:", order)
 
     except Exception as e:
-        print("❌ ERROR CRÍTICO:", e)
+        print("❌ ERROR:", e)
 
 # =============================
-# 🔁 LOOP PRINCIPAL
+# 🔁 LOOP
 # =============================
-
 while True:
-    try:
-        print("\n🔍 Escaneando mercado...")
+    print("\n🔍 Escaneando...")
 
-        df = get_candles()
-        df = calculate_ema(df)
+    price = get_price()
 
-        price = df["close"].iloc[-1]
-        ema50 = df["ema50"].iloc[-1]
-        ema200 = df["ema200"].iloc[-1]
+    if price is None:
+        time.sleep(5)
+        continue
 
-        trend = get_trend(df)
+    print(f"💰 Precio: {price}")
 
-        print(f"📊 Precio: {price}")
-        print(f"📈 EMA50: {ema50} | EMA200: {ema200}")
+    trend = get_trend(price)
 
-        if trend == "UP":
-            print("📈 Tendencia ALCISTA")
-            place_order("buy")
+    print(f"📊 Tendencia: {trend}")
 
-        elif trend == "DOWN":
-            print("📉 Tendencia BAJISTA")
-            place_order("sell")
+    if trend == "UP":
+        place_order("buy")
 
-        else:
-            print("⏳ Mercado lateral - sin entrada")
+    elif trend == "DOWN":
+        place_order("sell")
 
-    except Exception as e:
-        print("❌ ERROR GENERAL:", e)
+    else:
+        print("⏳ Esperando datos suficientes...")
 
-    time.sleep(60)
+    time.sleep(30)
