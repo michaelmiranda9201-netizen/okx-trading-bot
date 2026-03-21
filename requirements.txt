@@ -1,0 +1,8 @@
+requests
+pandas
+numpy
+ta
+scikit-learn
+tensorflow
+joblib
+psycopg2-binary
