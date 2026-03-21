@@ -1,10 +1,14 @@
 import os
 import time
 import requests
-from okx import Trade
+import hmac
+import base64
+import hashlib
+import json
+from datetime import datetime
 
 # =============================
-# 🔐 API CONFIG
+# 🔐 CONFIG
 # =============================
 API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
 SECRET_KEY = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
@@ -13,75 +17,76 @@ PASSPHRASE = os.getenv("WXcv8089@")
 if not API_KEY:
     raise Exception("❌ API KEYS NO CONFIGURADAS")
 
-tradeAPI = Trade.TradeAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, "0")
-
+BASE_URL = "https://www.okx.com"
 SYMBOL = "DOGE-USDT-SWAP"
-SIZE = "1"
+
+# =============================
+# 🔑 FIRMA OKX
+# =============================
+def sign(message, secret):
+    return base64.b64encode(
+        hmac.new(secret.encode(), message.encode(), hashlib.sha256).digest()
+    ).decode()
+
+def get_headers(method, path, body=""):
+    timestamp = datetime.utcnow().isoformat("T", "milliseconds") + "Z"
+    message = timestamp + method + path + body
+
+    return {
+        "OK-ACCESS-KEY": API_KEY,
+        "OK-ACCESS-SIGN": sign(message, SECRET_KEY),
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+        "Content-Type": "application/json"
+    }
 
 # =============================
 # 📊 PRECIO
 # =============================
 def get_price():
     try:
-        url = f"https://www.okx.com/api/v5/market/ticker?instId={SYMBOL}"
+        url = f"{BASE_URL}/api/v5/market/ticker?instId={SYMBOL}"
         data = requests.get(url).json()
         return float(data["data"][0]["last"])
     except:
-        print("❌ Error obteniendo precio")
+        print("❌ Error precio")
         return None
-
-# =============================
-# 🧠 TENDENCIA SIMPLE
-# =============================
-last_prices = []
-
-def get_trend(price):
-    last_prices.append(price)
-
-    if len(last_prices) > 10:
-        last_prices.pop(0)
-
-    if len(last_prices) < 10:
-        return "WAIT"
-
-    avg_old = sum(last_prices[:5]) / 5
-    avg_new = sum(last_prices[5:]) / 5
-
-    if avg_new > avg_old:
-        return "UP"
-    elif avg_new < avg_old:
-        return "DOWN"
-    else:
-        return "SIDE"
 
 # =============================
 # 🚀 ORDEN
 # =============================
 def place_order(side):
-    print(f"🚀 Enviando orden {side}...")
+    path = "/api/v5/trade/order"
+
+    body = json.dumps({
+        "instId": SYMBOL,
+        "tdMode": "cross",
+        "side": side,
+        "ordType": "market",
+        "sz": "1"
+    })
+
+    headers = get_headers("POST", path, body)
 
     try:
-        order = tradeAPI.place_order(
-            instId=SYMBOL,
-            tdMode="cross",
-            side=side,
-            ordType="market",
-            sz=SIZE
-        )
+        res = requests.post(BASE_URL + path, headers=headers, data=body)
+        data = res.json()
 
-        print("📤 OKX RESPONSE:", order)
+        print("📤 RESPUESTA OKX:", data)
 
-        if order.get("code") == "0":
+        if data.get("code") == "0":
             print("✅ ORDEN EJECUTADA")
         else:
-            print("❌ OKX ERROR:", order)
+            print("❌ ERROR:", data)
 
     except Exception as e:
-        print("❌ ERROR:", e)
+        print("❌ ERROR CRÍTICO:", e)
 
 # =============================
-# 🔁 LOOP
+# 🔁 LOOP SIMPLE
 # =============================
+last_price = None
+
 while True:
     print("\n🔍 Escaneando...")
 
@@ -93,17 +98,15 @@ while True:
 
     print(f"💰 Precio: {price}")
 
-    trend = get_trend(price)
+    if last_price:
+        if price > last_price:
+            print("📈 SUBIENDO → BUY")
+            place_order("buy")
 
-    print(f"📊 Tendencia: {trend}")
+        elif price < last_price:
+            print("📉 BAJANDO → SELL")
+            place_order("sell")
 
-    if trend == "UP":
-        place_order("buy")
+    last_price = price
 
-    elif trend == "DOWN":
-        place_order("sell")
-
-    else:
-        print("⏳ Esperando datos suficientes...")
-
-    time.sleep(30)
+    time.sleep(20)
