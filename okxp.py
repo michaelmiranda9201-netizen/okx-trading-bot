@@ -7,9 +7,6 @@ import os
 from datetime import datetime
 import pandas as pd
 
-# =========================
-# CONFIG
-# =========================
 API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
 SECRET_KEY = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
 PASSPHRASE = os.getenv("WXcv8089@")
@@ -17,7 +14,8 @@ PASSPHRASE = os.getenv("WXcv8089@")
 BASE_URL = "https://www.okx.com"
 SYMBOL = "BTC-USDT-SWAP"
 
-SIZE = "0.01"  # 🔥 tamaño mínimo seguro
+SIZE = "0.01"
+GRID_LEVELS = 5
 
 # =========================
 # AUTH
@@ -44,7 +42,8 @@ def candles(tf):
         url = f"/api/v5/market/candles?instId={SYMBOL}&bar={tf}&limit=100"
         r = requests.get(BASE_URL + url).json()
 
-        if 'data' not in r or len(r['data']) == 0:
+        if 'data' not in r:
+            print(f"❌ Sin datos {tf}")
             return None
 
         df = pd.DataFrame(r['data'],
@@ -52,8 +51,12 @@ def candles(tf):
 
         df = df[::-1]
         df[['c','h','l']] = df[['c','h','l']].astype(float)
+
+        print(f"📊 {tf} OK")
+
         return df
-    except:
+    except Exception as e:
+        print("Error candles:", e)
         return None
 
 # =========================
@@ -66,9 +69,12 @@ def atr(df):
     return (df['h'] - df['l']).rolling(14).mean()
 
 # =========================
-# IA MODO MERCADO
+# DETECTAR MODO
 # =========================
 def get_mode():
+
+    print("🧠 Analizando mercado...")
+
     h4 = candles("4H")
     h1 = candles("1H")
 
@@ -78,28 +84,23 @@ def get_mode():
     h4['ema50'], h4['ema200'] = ema(h4,50), ema(h4,200)
     h1['ema50'], h1['ema200'] = ema(h1,50), ema(h1,200)
 
-    if h4['ema50'].iloc[-1] > h4['ema200'].iloc[-1]:
+    if h4['ema50'].iloc[-1] > h4['ema200'].iloc[-1] and h1['ema50'].iloc[-1] > h1['ema200'].iloc[-1]:
+        print("📈 LONG MODE")
         return "long"
-    elif h4['ema50'].iloc[-1] < h4['ema200'].iloc[-1]:
+
+    elif h4['ema50'].iloc[-1] < h4['ema200'].iloc[-1] and h1['ema50'].iloc[-1] < h1['ema200'].iloc[-1]:
+        print("📉 SHORT MODE")
         return "short"
+
+    print("⚖️ NEUTRAL MODE")
     return "neutral"
 
 # =========================
-# APALANCAMIENTO
+# ORDEN
 # =========================
-def get_leverage(atr_val, price):
-    ratio = atr_val / price
+def place_order(side, px, sl, tp):
 
-    if ratio > 0.001:
-        return "3"
-    elif ratio > 0.0005:
-        return "5"
-    return "7"
-
-# =========================
-# ORDEN LIMIT (GRID REAL)
-# =========================
-def place_order(side, px, sl, tp, lev):
+    print(f"📥 Orden {side} @ {px}")
 
     body = json.dumps({
         "instId": SYMBOL,
@@ -108,7 +109,7 @@ def place_order(side, px, sl, tp, lev):
         "ordType": "limit",
         "px": str(px),
         "sz": SIZE,
-        "lever": lev,
+        "lever": "3",
         "slTriggerPx": str(sl),
         "tpTriggerPx": str(tp)
     })
@@ -119,88 +120,94 @@ def place_order(side, px, sl, tp, lev):
         headers=headers("POST", path, body),
         data=body)
 
-    print("ORDER:", r.json())
+    print("📡 OKX:", r.json())
 
 # =========================
-# GRID REAL
+# GRID ULTRA SCALPING
 # =========================
-def grid(price, atr_val, mode):
+def build_grid(price, atr_val, mode):
 
-    step = atr_val * 0.3
-    lev = get_leverage(atr_val, price)
+    step = atr_val * 0.25  # 🔥 ultra scalping
 
-    for i in range(1, 4):
+    print(f"⚙️ Construyendo grid | step: {step}")
+
+    for i in range(1, GRID_LEVELS + 1):
 
         if mode == "long":
+
             entry = price - step * i
             place_order(
                 "buy",
                 entry,
-                entry - atr_val,
-                entry + atr_val * 2,
-                lev
+                entry - atr_val * 0.8,
+                entry + atr_val * 1.5
             )
 
         elif mode == "short":
+
             entry = price + step * i
             place_order(
                 "sell",
                 entry,
-                entry + atr_val,
-                entry - atr_val * 2,
-                lev
+                entry + atr_val * 0.8,
+                entry - atr_val * 1.5
             )
 
         else:
+
             buy = price - step * i
             sell = price + step * i
 
-            place_order("buy", buy, buy - atr_val, buy + atr_val * 2, lev)
-            place_order("sell", sell, sell + atr_val, sell - atr_val * 2, lev)
-
-# =========================
-# PROFIT LOCK (BÁSICO)
-# =========================
-def profit_lock(price, atr_val, mode):
-    if mode == "long":
-        print(f"🔒 SL dinámico sugerido: {price - atr_val * 0.5}")
-    elif mode == "short":
-        print(f"🔒 SL dinámico sugerido: {price + atr_val * 0.5}")
+            place_order("buy", buy, buy - atr_val, buy + atr_val * 1.5)
+            place_order("sell", sell, sell + atr_val, sell - atr_val * 1.5)
 
 # =========================
 # RUN
 # =========================
 def run():
 
-    m5 = candles("5M")
+    print("🔍 Escaneando BTC...")
 
-    if m5 is None or len(m5) < 50:
+    m1 = candles("1m")
+
+    if m1 is None or len(m1) < 50:
+        print("❌ Sin datos 1M")
         return
 
-    price = m5['c'].iloc[-1]
-    atr_val = atr(m5).iloc[-1]
+    price = m1['c'].iloc[-1]
+
+    atr_series = atr(m1)
+
+    if atr_series is None or len(atr_series) < 20:
+        print("❌ ATR error")
+        return
+
+    atr_val = atr_series.iloc[-1]
 
     if pd.isna(atr_val) or atr_val == 0:
+        print("❌ ATR inválido")
         return
+
+    print(f"💰 Precio: {price} | ATR: {atr_val}")
 
     mode = get_mode()
 
-    print(f"🧠 MODE: {mode} | PRICE: {price}")
+    if mode is None:
+        print("❌ Sin modo")
+        return
 
-    # 🔥 ejecutar grid
-    grid(price, atr_val, mode)
+    print("🚀 Ejecutando GRID...")
 
-    # 🔒 profit lock info
-    profit_lock(price, atr_val, mode)
+    build_grid(price, atr_val, mode)
 
 # =========================
 # LOOP
 # =========================
 while True:
     try:
-        print("💀 BTC GRID SNIPER IA ACTIVO...")
+        print("\n💀 SNIPER GRID ULTRA ACTIVO...\n")
         run()
-        time.sleep(120)
+        time.sleep(90)
     except Exception as e:
-        print("ERROR:", e)
-        time.sleep(60)
+        print("💥 Error:", e)
+        time.sleep(30)
