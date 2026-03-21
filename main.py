@@ -1,34 +1,91 @@
 import time
+import os
 import joblib
 import numpy as np
-from tensorflow.keras.models import load_model
+import pandas as pd
+
+from sklearn.ensemble import RandomForestClassifier
+
 from strategy import add_indicators, rules_signal
 from ensemble import ensemble_signal
 
-ml_model = joblib.load("models/ml_model.pkl")
-lstm_model = load_model("models/lstm_model.h5")
+# =============================
+# CONFIG
+# =============================
+MODEL_PATH = "models/ml_model.pkl"
 
-def get_fake_data():
-    import pandas as pd
-    return pd.DataFrame({"close":[1,2,3,4,5]*20})
+# =============================
+# CREAR CARPETA MODELS SI NO EXISTE
+# =============================
+if not os.path.exists("models"):
+    os.makedirs("models")
 
+# =============================
+# CARGAR O CREAR MODELO ML
+# =============================
+if os.path.exists(MODEL_PATH):
+    print("✅ Cargando modelo ML existente...")
+    ml_model = joblib.load(MODEL_PATH)
+else:
+    print("⚠️ Modelo no encontrado, creando uno nuevo...")
+
+    ml_model = RandomForestClassifier()
+
+    # datos fake para inicializar
+    X = np.random.rand(20, 3)
+    y = np.random.choice([-1, 0, 1], size=20)
+
+    ml_model.fit(X, y)
+
+    joblib.dump(ml_model, MODEL_PATH)
+    print("✅ Modelo creado y guardado")
+
+# =============================
+# LSTM DESACTIVADO (Railway friendly)
+# =============================
+def lstm_signal():
+    return 0  # desactivado por estabilidad
+
+# =============================
+# DATA (SIMULADA POR AHORA)
+# =============================
+def get_data():
+    # ⚠️ luego aquí conectamos OKX real
+    df = pd.DataFrame({
+        "close": np.random.rand(200) * 100
+    })
+    return df
+
+# =============================
+# LOOP PRINCIPAL
+# =============================
 while True:
     try:
-        df = get_fake_data()
+        df = get_data()
+
         df = add_indicators(df)
 
-        features = [df.iloc[-1][["ema50","ema200","rsi"]]]
-        sequence = np.random.rand(1,50,1)
+        last = df.iloc[-1]
+
+        # features para ML
+        features = [[
+            last["ema50"],
+            last["ema200"],
+            last["rsi"]
+        ]]
 
         ml = ml_model.predict(features)[0]
-        lstm = lstm_model.predict(sequence)[0][0]
         rules = rules_signal(df)
+        lstm = lstm_signal()
 
         signal = ensemble_signal(ml, lstm, rules)
 
-        print("Signal:", signal)
+        print("-----")
+        print(f"ML: {ml} | RULES: {rules} | LSTM: {lstm}")
+        print(f"📊 SIGNAL: {signal}")
 
         time.sleep(10)
 
     except Exception as e:
-        print("Error:", e)
+        print("❌ Error:", e)
+        time.sleep(5)
