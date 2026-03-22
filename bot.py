@@ -12,11 +12,18 @@ import aiohttp
 API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
 SECRET = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
 PASSPHRASE = os.getenv("WXcv8089@")
-capital = float(os.getenv("INITIAL_CAPITAL", 50))
+INITIAL_CAPITAL = os.getenv("INITIAL_CAPITAL", "50")
 
-# Validación
-if not all([API_KEY, SECRET, PASSPHRASE]):
-    raise Exception("❌ Faltan variables de entorno: API_KEY, SECRET o PASSPHRASE")
+try:
+    capital = float(INITIAL_CAPITAL)
+except:
+    capital = 50
+    print("⚠️ INITIAL_CAPITAL no válida, usando 50 USDT")
+
+# ================= FLAGS =================
+REAL_TRADING = all([API_KEY, SECRET, PASSPHRASE])
+if not REAL_TRADING:
+    print("⚠️ Variables de entorno faltantes. El bot correrá en PAPER TRADING.")
 
 fee = 0.001
 trade_ratio = 0.95
@@ -26,11 +33,16 @@ spread_memory = []
 
 # ================= FUNCIONES =================
 def sign(ts, method, path, body=""):
+    if not REAL_TRADING:
+        return ""
     msg = str(ts) + method + path + (body if body else "")
     mac = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256)
     return base64.b64encode(mac.digest()).decode()
 
 async def place(session, symbol, side, sz, px):
+    if not REAL_TRADING:
+        print(f"📄 PAPER TRADE {side} {symbol} size:{sz} px:{px}")
+        return
     path = "/api/v5/trade/order"
     body = {
         "instId": symbol,
@@ -56,7 +68,7 @@ async def place(session, symbol, side, sz, px):
     except Exception as e:
         print("ORDER ERROR:", e)
 
-def calc_triangular(a1, a2):
+def calc_triangular(a1,a2):
     gross = a1 / a2
     net = gross * (1 - fee)**2
     return net - 1
@@ -78,7 +90,6 @@ async def ws_loop():
         {"channel":"books5","instId":"ETH-USDT"},
         {"channel":"books5","instId":"SOL-USDT"},
     ]
-
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
@@ -92,7 +103,7 @@ async def ws_loop():
                         ob = data["data"][0]
                         bid, bid_vol = float(ob["bids"][0][0]), float(ob["bids"][0][1])
                         ask, ask_vol = float(ob["asks"][0][0]), float(ob["asks"][0][1])
-                        orderbooks[inst] = (bid, bid_vol, ask, ask_vol)
+                        orderbooks[inst] = (bid,bid_vol,ask,ask_vol)
         except Exception as e:
             print("WS ERROR:", e)
             await asyncio.sleep(5)
@@ -113,24 +124,21 @@ async def arbitrage_loop():
                         b2,v2,a2,av2 = orderbooks[t[1]]
 
                         spread = calc_triangular(a1,a2)
-                        depth = (av1 + av2)/2
+                        depth = (av1+av2)/2
                         velocity = spread - (spread_memory[-1] if spread_memory else 0)
                         score = ai_score(spread, depth, velocity)
                         spread_memory.append(spread)
 
                         if score >= 3:
-                            trade = capital * trade_ratio
+                            trade = capital*trade_ratio
                             alt_amount = trade / a2
-
-                            await place(session, t[0], "buy", trade, a1*0.999)
-                            await place(session, t[1], "sell", alt_amount, a2*1.001)
-
-                            gain = trade * spread
+                            await place(session,t[0],"buy",trade,a1*0.999)
+                            await place(session,t[1],"sell",alt_amount,a2*1.001)
+                            gain = trade*spread
                             capital += gain
                             print(f"🚀 TRADE {t} Spread:{spread*100:.3f}% Score:{score} Capital:{capital:.2f}")
                         else:
                             print(f"Spread:{spread*100:.3f}% Score:{score}")
-
                 await asyncio.sleep(0.05)
             except Exception as e:
                 print("ARBITRAGE ERROR:", e)
