@@ -8,10 +8,15 @@ import hashlib
 import websockets
 import aiohttp
 
+# ================= VARIABLES =================
 API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
 SECRET = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
 PASSPHRASE = os.getenv("WXcv8089@")
 capital = float(os.getenv("INITIAL_CAPITAL", 50))
+
+# Validación
+if not all([API_KEY, SECRET, PASSPHRASE]):
+    raise Exception("❌ Faltan variables de entorno: API_KEY, SECRET o PASSPHRASE")
 
 fee = 0.001
 trade_ratio = 0.95
@@ -19,44 +24,42 @@ trade_ratio = 0.95
 orderbooks = {}
 spread_memory = []
 
-# ================= SIGN =================
+# ================= FUNCIONES =================
 def sign(ts, method, path, body=""):
-    msg = str(ts)+method+path+body
+    msg = str(ts) + method + path + (body if body else "")
     mac = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256)
     return base64.b64encode(mac.digest()).decode()
 
-# ================= ORDER =================
 async def place(session, symbol, side, sz, px):
-    path="/api/v5/trade/order"
+    path = "/api/v5/trade/order"
     body = {
-        "instId":symbol,
-        "tdMode":"cash",
-        "side":side,
-        "ordType":"limit",
-        "px":str(px),
-        "sz":str(sz)
+        "instId": symbol,
+        "tdMode": "cash",
+        "side": side,
+        "ordType": "limit",
+        "px": str(px),
+        "sz": str(sz)
     }
     body_json = json.dumps(body)
     ts = str(time.time())
     headers = {
-        "OK-ACCESS-KEY":API_KEY,
-        "OK-ACCESS-SIGN":sign(ts,"POST",path,body_json),
-        "OK-ACCESS-TIMESTAMP":ts,
-        "OK-ACCESS-PASSPHRASE":PASSPHRASE,
-        "Content-Type":"application/json"
+        "OK-ACCESS-KEY": API_KEY,
+        "OK-ACCESS-SIGN": sign(ts, "POST", path, body_json),
+        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+        "Content-Type": "application/json"
     }
     try:
-        async with session.post("https://www.okx.com"+path,data=body_json,headers=headers) as r:
+        async with session.post("https://www.okx.com"+path, data=body_json, headers=headers) as r:
             txt = await r.text()
             print("ORDER:", txt)
     except Exception as e:
         print("ORDER ERROR:", e)
 
-# ================= SPREAD =================
-def calc_triangular(a1,a2,b3):
-    gross=(1/a1)*(1/a2)*b3
-    net=gross*(1-fee)**3
-    return net-1
+def calc_triangular(a1, a2):
+    gross = a1 / a2
+    net = gross * (1 - fee)**2
+    return net - 1
 
 def ai_score(spread, depth, velocity):
     score = 0
@@ -69,8 +72,7 @@ def ai_score(spread, depth, velocity):
 # ================= WEBSOCKET =================
 async def ws_loop():
     global orderbooks
-    uri="wss://ws.okx.com:8443/ws/v5/public"
-
+    uri = "wss://ws.okx.com:8443/ws/v5/public"
     subs = [
         {"channel":"books5","instId":"BTC-USDT"},
         {"channel":"books5","instId":"ETH-USDT"},
@@ -82,7 +84,6 @@ async def ws_loop():
             async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
                 await ws.send(json.dumps({"op":"subscribe","args":subs}))
                 print("✅ WS CONNECTED")
-
                 while True:
                     msg = await ws.recv()
                     data = json.loads(msg)
@@ -91,9 +92,9 @@ async def ws_loop():
                         ob = data["data"][0]
                         bid, bid_vol = float(ob["bids"][0][0]), float(ob["bids"][0][1])
                         ask, ask_vol = float(ob["asks"][0][0]), float(ob["asks"][0][1])
-                        orderbooks[inst]=(bid,bid_vol,ask,ask_vol)
+                        orderbooks[inst] = (bid, bid_vol, ask, ask_vol)
         except Exception as e:
-            print("WS ERROR:",e)
+            print("WS ERROR:", e)
             await asyncio.sleep(5)
 
 # ================= ARBITRAGE =================
@@ -102,34 +103,29 @@ async def arbitrage_loop():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                # Triángulos posibles:
-                # BTC-USDT <-> ETH-USDT
-                # BTC-USDT <-> SOL-USDT
                 triangles = [
                     ("BTC-USDT","ETH-USDT"),
                     ("BTC-USDT","SOL-USDT"),
                 ]
                 for t in triangles:
                     if all(p in orderbooks for p in t):
-                        b1,v1,a1,av1=orderbooks[t[0]]
-                        b2,v2,a2,av2=orderbooks[t[1]]
+                        b1,v1,a1,av1 = orderbooks[t[0]]
+                        b2,v2,a2,av2 = orderbooks[t[1]]
 
-                        # triangular simplificado: BTC <-> alt <-> USDT
-                        spread = (a1/a2)-1
-                        depth=(av1+av2)/2
+                        spread = calc_triangular(a1,a2)
+                        depth = (av1 + av2)/2
                         velocity = spread - (spread_memory[-1] if spread_memory else 0)
-                        score=ai_score(spread,depth,velocity)
+                        score = ai_score(spread, depth, velocity)
                         spread_memory.append(spread)
 
-                        if score>=3:
-                            trade = capital*trade_ratio
+                        if score >= 3:
+                            trade = capital * trade_ratio
                             alt_amount = trade / a2
 
-                            # REAL ORDERS
-                            await place(session,t[0],"buy",trade,a1*0.999)
-                            await place(session,t[1],"sell",alt_amount,a2*1.001)
+                            await place(session, t[0], "buy", trade, a1*0.999)
+                            await place(session, t[1], "sell", alt_amount, a2*1.001)
 
-                            gain = trade*spread
+                            gain = trade * spread
                             capital += gain
                             print(f"🚀 TRADE {t} Spread:{spread*100:.3f}% Score:{score} Capital:{capital:.2f}")
                         else:
@@ -137,7 +133,7 @@ async def arbitrage_loop():
 
                 await asyncio.sleep(0.05)
             except Exception as e:
-                print("ARBITRAGE ERROR:",e)
+                print("ARBITRAGE ERROR:", e)
                 await asyncio.sleep(1)
 
 # ================= MAIN =================
