@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import os
 import hmac
 import base64
 import hashlib
@@ -8,87 +9,46 @@ import aiohttp
 import websockets
 import numpy as np
 
-API_KEY="db75d70b-f577-40e5-b06c-60b9c87584a7"
-SECRET="DD0B0C2024162F50F4267C1D59C4AC81"
-PASSPHRASE="WXcv8089@"
+API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
+SECRET = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
+PASSPHRASE = os.getenv("WXcv8089@")
 
-capital=50
-fee=0.001
-trade_ratio=0.99
+capital = float(os.getenv("INITIAL_CAPITAL", 50))
 
-orderbooks={}
-spread_memory=[]
+fee = 0.001
+trade_ratio = 0.97
 
-triangles=[
+orderbooks = {}
+spread_memory = []
+
+triangles = [
     ("BTC-USDT","ETH-BTC","ETH-USDT"),
-    ("BTC-USDT","SOL-BTC","SOL-USDT")
 ]
 
-# ---------- IA ENGINE ----------
+# ================= IA SCORE =================
 
-def ai_predict(spread,depth,velocity):
-
-    score=0
-
-    if spread>0.001:
-        score+=2
-
-    if spread>0.002:
-        score+=3
-
-    if depth>3:
-        score+=2
-
-    if velocity>0:
-        score+=2
-
-    if len(spread_memory)>5:
-        if spread>np.mean(spread_memory[-5:]):
-            score+=2
-
+def ai_score(spread, depth, velocity):
+    score = 0
+    if spread > 0.002:
+        score += 4
+    if spread > 0.003:
+        score += 3
+    if depth > 3:
+        score += 2
+    if velocity > 0:
+        score += 2
     return score
 
-# ---------- ORDERBOOK WS ----------
+# ================= SIGN =================
 
-async def ws_orderbook():
-
-    uri="wss://ws.okx.com:8443/ws/v5/public"
-
-    async with websockets.connect(uri) as ws:
-
-        subs=[]
-
-        for t in triangles:
-            for s in t:
-                subs.append({"channel":"books5","instId":s})
-
-        await ws.send(json.dumps({"op":"subscribe","args":subs}))
-
-        while True:
-
-            msg=json.loads(await ws.recv())
-
-            if "data" in msg:
-
-                inst=msg["arg"]["instId"]
-                ob=msg["data"][0]
-
-                bid=float(ob["bids"][0][0])
-                bid_vol=float(ob["bids"][0][1])
-
-                ask=float(ob["asks"][0][0])
-                ask_vol=float(ob["asks"][0][1])
-
-                orderbooks[inst]=(bid,bid_vol,ask,ask_vol)
-
-# ---------- EXECUTION ENGINE ----------
-
-def sign(ts,method,path,body=""):
-    msg=str(ts)+method+path+body
-    mac=hmac.new(bytes(SECRET,'utf-8'),bytes(msg,'utf-8'),hashlib.sha256)
+def sign(ts, method, path, body=""):
+    msg = str(ts)+method+path+body
+    mac = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256)
     return base64.b64encode(mac.digest()).decode()
 
-async def place(session,symbol,side,sz,px):
+# ================= ORDER =================
+
+async def place(session, symbol, side, sz, px):
 
     path="/api/v5/trade/order"
 
@@ -111,17 +71,76 @@ async def place(session,symbol,side,sz,px):
         "Content-Type":"application/json"
     }
 
-    async with session.post("https://www.okx.com"+path,data=body,headers=headers) as r:
-        return await r.text()
+    try:
+        async with session.post("https://www.okx.com"+path,data=body,headers=headers) as r:
+            txt = await r.text()
+            print("ORDER:", txt)
+    except Exception as e:
+        print("ORDER ERROR:", e)
 
-# ---------- ARBITRAGE ENGINE ----------
+# ================= SPREAD =================
 
 def calc(a1,a2,b3):
-    gross=(1/a1)*(1/a2)*b3
-    net=gross*(1-fee)**3
-    return net-1
+    gross = (1/a1)*(1/a2)*b3
+    net = gross*(1-fee)**3
+    return net - 1
 
-async def arbitrage():
+# ================= WS FEED =================
+
+async def ws_loop():
+
+    global orderbooks
+
+    uri = "wss://ws.okx.com:8443/ws/v5/public"
+
+    while True:
+
+        try:
+
+            async with websockets.connect(
+                uri,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5
+            ) as ws:
+
+                sub = {
+                    "op":"subscribe",
+                    "args":[
+                        {"channel":"books5","instId":"BTC-USDT"},
+                        {"channel":"books5","instId":"ETH-BTC"},
+                        {"channel":"books5","instId":"ETH-USDT"},
+                    ]
+                }
+
+                await ws.send(json.dumps(sub))
+
+                print("✅ WS CONNECTED")
+
+                while True:
+
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+
+                    if "data" in data:
+
+                        inst = data["arg"]["instId"]
+                        ob = data["data"][0]
+
+                        bid = float(ob["bids"][0][0])
+                        bid_vol = float(ob["bids"][0][1])
+                        ask = float(ob["asks"][0][0])
+                        ask_vol = float(ob["asks"][0][1])
+
+                        orderbooks[inst] = (bid,bid_vol,ask,ask_vol)
+
+        except Exception as e:
+            print("WS ERROR:", e)
+            await asyncio.sleep(5)
+
+# ================= ARBITRAGE =================
+
+async def arbitrage_loop():
 
     global capital
 
@@ -131,55 +150,54 @@ async def arbitrage():
 
             try:
 
-                for t in triangles:
+                if not all(s in orderbooks for s in triangles[0]):
+                    await asyncio.sleep(0.2)
+                    continue
 
-                    if not all(s in orderbooks for s in t):
-                        continue
+                b1,v1,a1,av1 = orderbooks["BTC-USDT"]
+                b2,v2,a2,av2 = orderbooks["ETH-BTC"]
+                b3,v3,a3,av3 = orderbooks["ETH-USDT"]
 
-                    b1,v1,a1,av1=orderbooks[t[0]]
-                    b2,v2,a2,av2=orderbooks[t[1]]
-                    b3,v3,a3,av3=orderbooks[t[2]]
+                spread = calc(a1,a2,b3)
+                spread_memory.append(spread)
 
-                    spread=calc(a1,a2,b3)
+                velocity = spread - (spread_memory[-2] if len(spread_memory)>2 else 0)
+                depth = (av1+av2+v3)/3
 
-                    spread_memory.append(spread)
+                score = ai_score(spread,depth,velocity)
 
-                    depth=(av1+av2+v3)/3
+                print("Spread:",round(spread*100,4),"Score:",score)
 
-                    velocity=spread-(spread_memory[-2] if len(spread_memory)>2 else 0)
+                if score >= 7:
 
-                    score=ai_predict(spread,depth,velocity)
+                    trade = capital * trade_ratio
 
-                    print(t,"Spread",spread*100,"Score",score)
+                    btc = trade / a1
+                    eth = btc / a2
 
-                    if score>=7:
+                    await place(session,"BTC-USDT","buy",btc,a1*0.999)
+                    await place(session,"ETH-BTC","buy",eth,a2*0.999)
+                    await place(session,"ETH-USDT","sell",eth,b3*1.001)
 
-                        trade=capital*trade_ratio
+                    gain = trade * spread
+                    capital += gain
 
-                        btc=trade/a1
-                        eth=btc/a2
+                    print("🚀 CAPITAL:",capital)
 
-                        await place(session,t[0],"buy",btc,a1*0.999)
-                        await place(session,t[1],"buy",eth,a2*0.999)
-                        await place(session,t[2],"sell",eth,b3*1.001)
+                print("❤️ BOT ALIVE", time.time())
 
-                        gain=trade*spread
-                        capital+=gain
-
-                        print("☠️ MONSTER ARBITRAJE")
-                        print("Capital:",capital)
-
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.15)
 
             except Exception as e:
-                print("Error",e)
-                await asyncio.sleep(1)
+                print("ARBITRAGE ERROR:", e)
+                await asyncio.sleep(2)
+
+# ================= MAIN =================
 
 async def main():
-
     await asyncio.gather(
-        ws_orderbook(),
-        arbitrage()
+        ws_loop(),
+        arbitrage_loop()
     )
 
 asyncio.run(main())
