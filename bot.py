@@ -12,18 +12,12 @@ import aiohttp
 API_KEY = os.getenv("db75d70b-f577-40e5-b06c-60b9c87584a7")
 SECRET = os.getenv("DD0B0C2024162F50F4267C1D59C4AC81")
 PASSPHRASE = os.getenv("WXcv8089@")
-INITIAL_CAPITAL = os.getenv("INITIAL_CAPITAL", "50")
-
-try:
-    capital = float(INITIAL_CAPITAL)
-except:
-    capital = 50
-    print("⚠️ INITIAL_CAPITAL no válida, usando 50 USDT")
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", 50))
 
 # ================= FLAGS =================
 REAL_TRADING = all([API_KEY, SECRET, PASSPHRASE])
 if not REAL_TRADING:
-    print("⚠️ Variables de entorno faltantes. El bot correrá en PAPER TRADING.")
+    raise Exception("❌ Faltan variables de entorno: API_KEY, SECRET o PASSPHRASE")
 
 fee = 0.001
 trade_ratio = 0.95
@@ -33,16 +27,15 @@ spread_memory = []
 
 # ================= FUNCIONES =================
 def sign(ts, method, path, body=""):
-    if not REAL_TRADING:
-        return ""
     msg = str(ts) + method + path + (body if body else "")
     mac = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256)
     return base64.b64encode(mac.digest()).decode()
 
 async def place(session, symbol, side, sz, px):
-    if not REAL_TRADING:
-        print(f"📄 PAPER TRADE {side} {symbol} size:{sz} px:{px}")
-        return
+    # Redondeo según mínimo de OKX
+    sz = max(0.0001, round(sz, 6))  # 6 decimales para cripto
+    px = round(px, 2)               # precio 2 decimales USDT
+
     path = "/api/v5/trade/order"
     body = {
         "instId": symbol,
@@ -123,6 +116,11 @@ async def arbitrage_loop():
                         b1,v1,a1,av1 = orderbooks[t[0]]
                         b2,v2,a2,av2 = orderbooks[t[1]]
 
+                        # Validar precios
+                        if a1 <=0 or a2 <=0:
+                            print(f"⚠️ Precio inválido: a1={a1}, a2={a2}. Saltando trade.")
+                            continue
+
                         spread = calc_triangular(a1,a2)
                         depth = (av1+av2)/2
                         velocity = spread - (spread_memory[-1] if spread_memory else 0)
@@ -132,13 +130,17 @@ async def arbitrage_loop():
                         if score >= 3:
                             trade = capital*trade_ratio
                             alt_amount = trade / a2
+
+                            # Ejecutar órdenes reales
                             await place(session,t[0],"buy",trade,a1*0.999)
                             await place(session,t[1],"sell",alt_amount,a2*1.001)
+
                             gain = trade*spread
                             capital += gain
                             print(f"🚀 TRADE {t} Spread:{spread*100:.3f}% Score:{score} Capital:{capital:.2f}")
                         else:
                             print(f"Spread:{spread*100:.3f}% Score:{score}")
+
                 await asyncio.sleep(0.05)
             except Exception as e:
                 print("ARBITRAGE ERROR:", e)
