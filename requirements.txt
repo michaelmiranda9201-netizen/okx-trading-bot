@@ -1,8 +1,3 @@
-requests
-pandas
+aiohttp
+asyncio
 numpy
-ta
-scikit-learn
-tensorflow
-joblib
-psycopg2-binary
